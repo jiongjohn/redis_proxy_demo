@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # 主Redis服务器 - 代理的后端目标
+  redis:
+    image: redis:7-alpine
+    container_name: redis_backend
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server 
+      --appendonly yes 
+      --save 60 1000
+      --loglevel notice
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+      - ./docker/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - redis_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    environment:
+      - REDIS_REPLICATION_MODE=master
+
+  # Redis管理界面 (可选)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis_commander
+    ports:
+      - "8082:8081"
+    environment:
+      REDIS_HOSTS: backend:redis:6379
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      HTTP_USER: admin
+      HTTP_PASSWORD: admin123
+    depends_on:
+      - redis
+    networks:
+      - redis_network
+    profiles:
+      - ui
+    restart: unless-stopped
+
+  # 用于性能测试的Redis客户端
+  redis-benchmark:
+    image: redis:7-alpine
+    container_name: redis_benchmark
+    command: >
+      sh -c "
+        echo '⏳ 等待Redis服务启动...' &&
+        sleep 5 &&
+        echo '🚀 开始Redis基准测试...' &&
+        redis-benchmark -h redis -p 6379 -t ping,set,get -n 10000 -c 10 -d 64 -q &&
+        echo '✅ 基准测试完成'
+      "
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - redis_network
+    profiles:
+      - benchmark
+    restart: "no"
+
+volumes:
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./docker/data/redis
+
+networks:
+  redis_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
