@@ -217,6 +217,10 @@ func (h *GoRedisHandler) handleRegularCommand(session *ClientSession, cmdName st
 	// Execute immediately using the shared Redis client
 	err := session.rdb.Process(h.ctx, cmd)
 	if err != nil {
+		// Special handling for redis.Nil - this should return null, not an error
+		if err == redis.Nil {
+			return h.sendNull(session.ClientConn)
+		}
 		return h.sendError(session.ClientConn, err)
 	}
 
@@ -316,6 +320,10 @@ func (h *GoRedisHandler) sendArray(conn net.Conn, items []interface{}) error {
 
 func (h *GoRedisHandler) sendCommandResult(conn net.Conn, cmd redis.Cmder) error {
 	if err := cmd.Err(); err != nil {
+		// Special handling for redis.Nil - this should return null, not an error
+		if err == redis.Nil {
+			return h.sendNull(conn)
+		}
 		return h.sendError(conn, err)
 	}
 
@@ -324,11 +332,22 @@ func (h *GoRedisHandler) sendCommandResult(conn net.Conn, cmd redis.Cmder) error
 	case *redis.Cmd:
 		result, err := c.Result()
 		if err != nil {
+			// Special handling for redis.Nil - this should return null, not an error
+			if err == redis.Nil {
+				return h.sendNull(conn)
+			}
 			return h.sendError(conn, err)
 		}
 		return h.sendGenericResult(conn, result)
 	case *redis.StringCmd:
-		result := c.Val()
+		result, err := c.Result()
+		if err != nil {
+			// Special handling for redis.Nil - this should return null, not an error
+			if err == redis.Nil {
+				return h.sendNull(conn)
+			}
+			return h.sendError(conn, err)
+		}
 		return h.sendBulkString(conn, result)
 	case *redis.IntCmd:
 		result := c.Val()
@@ -362,6 +381,10 @@ func (h *GoRedisHandler) sendCommandResult(conn net.Conn, cmd redis.Cmder) error
 func (h *GoRedisHandler) sendGenericResult(conn net.Conn, result interface{}) error {
 	switch v := result.(type) {
 	case string:
+		// Handle status strings that should be sent as simple strings (+) not bulk strings ($)
+		if isStatusString(v) {
+			return h.sendSimpleString(conn, v)
+		}
 		return h.sendBulkString(conn, v)
 	case int64:
 		return h.sendInteger(conn, v)
@@ -381,6 +404,34 @@ func (h *GoRedisHandler) sendGenericResult(conn net.Conn, result interface{}) er
 		// Try to convert to string as fallback
 		return h.sendBulkString(conn, fmt.Sprintf("%v", v))
 	}
+}
+
+// isStatusString checks if a string should be sent as RESP simple string (+) instead of bulk string ($)
+func isStatusString(s string) bool {
+	// Common Redis status responses that should be sent as simple strings
+	statusStrings := []string{
+		"OK",
+		"PONG",
+		"QUEUED",
+		"NOKEY",
+		"WRONGTYPE",
+	}
+
+	for _, status := range statusStrings {
+		if s == status {
+			return true
+		}
+	}
+
+	// Check for other common status patterns
+	if strings.HasPrefix(s, "FULLRESYNC") ||
+		strings.HasPrefix(s, "CONTINUE") ||
+		strings.HasPrefix(s, "NOAUTH") ||
+		strings.HasPrefix(s, "LOADING") {
+		return true
+	}
+
+	return false
 }
 
 // Close closes the handler

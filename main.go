@@ -17,7 +17,7 @@ func main() {
 	fmt.Println("🚀 Redis Proxy Demo - Starting...")
 
 	// Parse command line arguments
-	var configFile = flag.String("c", "etc/config.yaml", "Configuration file path")
+	var configFile = flag.String("c", "etc/config-goredis-v2-fixed.yaml", "Configuration file path")
 	flag.Parse()
 
 	// Load configuration
@@ -76,7 +76,13 @@ func main() {
 	serverType := "Traditional"
 	connectionMode := "Connection Pool"
 
-	if c.Server.UseGoRedis {
+	if c.Server.UseGoRedisV2Fixed {
+		serverType = "go-redis V2 Fixed Enhanced Proxy (production-ready)"
+		connectionMode = "Session-based + Proto Parsing + Direct RESP"
+	} else if c.Server.UseGoRedisV2 {
+		serverType = "go-redis V2 Enhanced Proxy (with proto package)"
+		connectionMode = "Session-based + Proto Package Optimization"
+	} else if c.Server.UseGoRedis {
 		serverType = "go-redis Smart Proxy"
 		connectionMode = "Session-based Connection Pooling"
 	} else if c.Server.UseAffinity {
@@ -121,7 +127,35 @@ func main() {
 	}
 
 	// Create appropriate server based on configuration
-	if c.Server.UseGoRedis {
+	if c.Server.UseGoRedisV2Fixed {
+		// Use final enhanced go-redis V2 Fixed server with proto package
+		server, err := proxy.NewGoRedisV2ServerFixed(proxyConfig)
+		if err != nil {
+			log.Fatalf("Failed to create go-redis V2 Fixed proxy server: %v", err)
+		}
+
+		logx.Info("🚀 go-redis V2 Fixed Enhanced Proxy (production-ready) starting...")
+		logx.Info("✅ HELLO command support for RESP3 compatibility")
+		logx.Info("✅ Perfect Mixed RESP + Inline Command Support")
+		logx.Info("✅ 100% Accurate Escape Character Handling")
+		logx.Info("🔗 Production-ready optimized connection pooling")
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start go-redis V2 Fixed proxy server: %v", err)
+		}
+	} else if c.Server.UseGoRedisV2 {
+		// Use enhanced go-redis V2 server with proto package
+		server, err := proxy.NewGoRedisV2Server(proxyConfig)
+		if err != nil {
+			log.Fatalf("Failed to create go-redis V2 proxy server: %v", err)
+		}
+
+		logx.Info("🚀 go-redis V2 Enhanced Proxy starting...")
+		logx.Info("✅ Proto package optimization enabled")
+		logx.Info("🔗 Session-based connection management")
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start go-redis V2 proxy server: %v", err)
+		}
+	} else if c.Server.UseGoRedis {
 		// Use go-redis server with session management
 		server, err := proxy.NewGoRedisServer(proxyConfig)
 		if err != nil {
