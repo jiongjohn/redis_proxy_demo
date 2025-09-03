@@ -8,7 +8,31 @@ type Config struct {
 		ReadTimeout    string `json:",default=30s"`
 		WriteTimeout   string `json:",default=30s"`
 		IdleTimeout    string `json:",default=300s"`
-		UseGnet        bool   `json:"use_gnet,default=false"` // Use gnet for high-performance server
+		UseGnet        bool   `json:"use_gnet,default=false" yaml:"use_gnet"`         // Use gnet for high-performance server
+		UseAffinity    bool   `json:"use_affinity,default=false" yaml:"use_affinity"` // Use connection affinity for stateful commands
+		UseGoRedis     bool   `json:"use_goredis,default=false" yaml:"use_goredis"`   // Use go-redis with session management
+	}
+
+	// ConnectionAffinity configuration for connection affinity mode
+	ConnectionAffinity struct {
+		MaxConnections      int    `json:",default=1000"`  // Maximum concurrent connections
+		IdleTimeout         string `json:",default=5m"`    // Idle connection timeout
+		HealthCheckInterval string `json:",default=30s"`   // Health check interval
+		BufferSize          int    `json:",default=32768"` // Buffer size for data forwarding (32KB)
+		StatsInterval       string `json:",default=30s"`   // Statistics reporting interval
+	}
+
+	// GoRedis configuration for go-redis mode
+	GoRedis struct {
+		PoolSize       int    `json:",default=10"`  // Redis connection pool size
+		MinIdleConns   int    `json:",default=2"`   // Minimum idle connections
+		MaxConnAge     string `json:",default=1h"`  // Maximum connection age
+		IdleTimeout    string `json:",default=30m"` // Connection idle timeout
+		DialTimeout    string `json:",default=10s"` // Connection dial timeout
+		ReadTimeout    string `json:",default=5s"`  // Read timeout
+		WriteTimeout   string `json:",default=5s"`  // Write timeout
+		SessionTimeout string `json:",default=1h"`  // Client session timeout
+		StatsInterval  string `json:",default=60s"` // Statistics reporting interval
 	}
 
 	Redis struct {
