@@ -3,14 +3,16 @@ package config
 // Config represents the application configuration
 type Config struct {
 	Server struct {
-		Port           int    `json:",default=6380"`
-		MaxConnections int    `json:",default=1000"`
-		ReadTimeout    string `json:",default=30s"`
-		WriteTimeout   string `json:",default=30s"`
-		IdleTimeout    string `json:",default=300s"`
-		UseGnet        bool   `json:"use_gnet,default=false" yaml:"use_gnet"`         // Use gnet for high-performance server
-		UseAffinity    bool   `json:"use_affinity,default=false" yaml:"use_affinity"` // Use connection affinity for stateful commands
-		UseGoRedis     bool   `json:"use_goredis,default=false" yaml:"use_goredis"`   // Use go-redis with session management
+		Port              int    `json:",default=6380"`
+		MaxConnections    int    `json:",default=1000"`
+		ReadTimeout       string `json:",default=30s"`
+		WriteTimeout      string `json:",default=30s"`
+		IdleTimeout       string `json:",default=300s"`
+		UseGnet           bool   `json:"use_gnet,default=false" yaml:"use_gnet"`                         // Use gnet for high-performance server
+		UseAffinity       bool   `json:"use_affinity,default=false" yaml:"use_affinity"`                 // Use connection affinity for stateful commands
+		UseGoRedis        bool   `json:"use_goredis,default=false" yaml:"use_goredis"`                   // Use go-redis with session management
+		UseGoRedisV2      bool   `json:"use_goredis_v2,default=false" yaml:"use_goredis_v2"`             // Use go-redis V2 with proto package enhancement
+		UseGoRedisV2Fixed bool   `json:"use_goredis_v2_fixed,default=false" yaml:"use_goredis_v2_fixed"` // Use go-redis V2 Fixed (direct RESP responses)
 	}
 
 	// ConnectionAffinity configuration for connection affinity mode
