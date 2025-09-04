@@ -1,0 +1,49 @@
+# Redis Proxy Configuration - go-redis V2 Mode (Enhanced with proto package)
+
+server:
+  port: 6383  # Use different port to avoid conflict
+  max_connections: 1000
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "300s"
+  use_gnet: false
+  use_affinity: false  
+  use_goredis: false
+  use_goredis_v2: true  # Enable enhanced go-redis V2 mode
+
+# GoRedis V2 specific configuration (enhanced performance and features)
+goredis:
+  pool_size: 15          # Increased pool size for better performance
+  min_idle_conns: 3      # Minimum idle connections
+  max_conn_age: "2h"     # Maximum connection age
+  idle_timeout: "45m"    # Connection idle timeout
+  dial_timeout: "15s"    # Connection dial timeout
+  read_timeout: "10s"    # Read timeout
+  write_timeout: "10s"   # Write timeout
+  session_timeout: "2h"  # Client session timeout
+  stats_interval: "30s"  # Statistics reporting interval
+
+# Redis backend configuration
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  database: 0
+  pool_size: 15          # Match goredis pool size
+  min_idle_connections: 3
+  max_idle_connections: 8
+  connection_timeout: "10s"
+  read_timeout: "8s"
+  write_timeout: "8s"
+
+# Pool configuration
+pool:
+  max_idle: 10
+  max_active: 20
+  idle_timeout: "300s"
+  wait: true
+
+# Logging configuration
+log:
+  level: "info"
+  format: "text"

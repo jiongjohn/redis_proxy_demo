@@ -76,7 +76,10 @@ func main() {
 	serverType := "Traditional"
 	connectionMode := "Connection Pool"
 
-	if c.Server.UseGoRedisV2Fixed {
+	if c.Server.UseIntelligentPool {
+		serverType = "Intelligent Connection Pool Proxy"
+		connectionMode = "NORMAL/INIT/SESSION Command Classification"
+	} else if c.Server.UseGoRedisV2Fixed {
 		serverType = "go-redis V2 Fixed Enhanced Proxy (production-ready)"
 		connectionMode = "Session-based + Proto Parsing + Direct RESP"
 	} else if c.Server.UseGoRedisV2 {
@@ -104,7 +107,17 @@ func main() {
 		return "Disabled"
 	}())
 
-	if c.Server.UseGoRedis {
+	if c.Server.UseIntelligentPool {
+		// Show intelligent pool specific configuration
+		fmt.Printf("├── Max Pool Size: %d\n", c.IntelligentPool.MaxPoolSize)
+		fmt.Printf("├── Min Idle Connections: %d\n", c.IntelligentPool.MinIdleConns)
+		fmt.Printf("├── Max Idle Connections: %d\n", c.IntelligentPool.MaxIdleConns)
+		fmt.Printf("├── Session Timeout: %s\n", c.IntelligentPool.SessionTimeout)
+		fmt.Printf("├── Command Classification: ✅ NORMAL/INIT/SESSION\n")
+		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
+		fmt.Printf("├── Transaction Support: ✅ MULTI/EXEC with Session State\n")
+		fmt.Printf("└── Smart Resource Management: ✅ Context-based Pooling\n")
+	} else if c.Server.UseGoRedis {
 		// Show go-redis specific configuration
 		fmt.Printf("├── Connection Pool Size: %d\n", c.GoRedis.PoolSize)
 		fmt.Printf("├── Min Idle Connections: %d\n", c.GoRedis.MinIdleConns)
@@ -127,7 +140,42 @@ func main() {
 	}
 
 	// Create appropriate server based on configuration
-	if c.Server.UseGoRedisV2Fixed {
+	if c.Server.UseIntelligentPool {
+		// Parse IntelligentPool configuration durations
+		idleTimeout, _ := time.ParseDuration(c.IntelligentPool.IdleTimeout)
+		maxLifetime, _ := time.ParseDuration(c.IntelligentPool.MaxLifetime)
+		cleanupInterval, _ := time.ParseDuration(c.IntelligentPool.CleanupInterval)
+		sessionTimeout, _ := time.ParseDuration(c.IntelligentPool.SessionTimeout)
+		commandTimeout, _ := time.ParseDuration(c.IntelligentPool.CommandTimeout)
+		connectionHoldTime, _ := time.ParseDuration(c.IntelligentPool.ConnectionHoldTime)
+
+		// Use intelligent connection pool server with detailed configuration
+		server, err := proxy.NewPoolServerWithDetailedConfig(
+			proxyConfig,
+			c.IntelligentPool.MaxPoolSize,
+			c.IntelligentPool.MinIdleConns,
+			c.IntelligentPool.MaxIdleConns,
+			idleTimeout,
+			maxLifetime,
+			cleanupInterval,
+			sessionTimeout,
+			commandTimeout,
+			connectionHoldTime,
+		)
+		if err != nil {
+			log.Fatalf("Failed to create intelligent pool proxy server: %v", err)
+		}
+
+		logx.Info("🚀 Intelligent Connection Pool Proxy starting...")
+		logx.Info("✅ Command Classification: NORMAL/INIT/SESSION")
+		logx.Info("✅ Smart Connection Reuse Based on Context")
+		logx.Info("✅ Optimized Resource Management")
+		logx.Info(fmt.Sprintf("🔗 Connection Hold Time: %v", connectionHoldTime))
+		logx.Info("🧠 Proto Library RESP Parsing")
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start intelligent pool proxy server: %v", err)
+		}
+	} else if c.Server.UseGoRedisV2Fixed {
 		// Use final enhanced go-redis V2 Fixed server with proto package
 		server, err := proxy.NewGoRedisV2ServerFixed(proxyConfig)
 		if err != nil {
