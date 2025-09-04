@@ -79,15 +79,6 @@ func main() {
 	if c.Server.UseIntelligentPool {
 		serverType = "Intelligent Connection Pool Proxy"
 		connectionMode = "NORMAL/INIT/SESSION Command Classification"
-	} else if c.Server.UseGoRedisV2Fixed {
-		serverType = "go-redis V2 Fixed Enhanced Proxy (production-ready)"
-		connectionMode = "Session-based + Proto Parsing + Direct RESP"
-	} else if c.Server.UseGoRedisV2 {
-		serverType = "go-redis V2 Enhanced Proxy (with proto package)"
-		connectionMode = "Session-based + Proto Package Optimization"
-	} else if c.Server.UseGoRedis {
-		serverType = "go-redis Smart Proxy"
-		connectionMode = "Session-based Connection Pooling"
 	} else if c.Server.UseAffinity {
 		serverType = "Connection Affinity"
 		connectionMode = "1:1 Connection Mapping"
@@ -117,14 +108,6 @@ func main() {
 		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
 		fmt.Printf("├── Transaction Support: ✅ MULTI/EXEC with Session State\n")
 		fmt.Printf("└── Smart Resource Management: ✅ Context-based Pooling\n")
-	} else if c.Server.UseGoRedis {
-		// Show go-redis specific configuration
-		fmt.Printf("├── Connection Pool Size: %d\n", c.GoRedis.PoolSize)
-		fmt.Printf("├── Min Idle Connections: %d\n", c.GoRedis.MinIdleConns)
-		fmt.Printf("├── Session Management: ✅ Enabled\n")
-		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
-		fmt.Printf("├── Transaction Support: ✅ MULTI/EXEC with State\n")
-		fmt.Printf("└── Resource Efficiency: ✅ Optimized Pool Usage\n")
 	} else if c.Server.UseAffinity {
 		// Show affinity-specific configuration
 		fmt.Printf("├── Max Client Connections: %d\n", c.Server.MaxConnections)
@@ -174,47 +157,6 @@ func main() {
 		logx.Info("🧠 Proto Library RESP Parsing")
 		if err := server.ListenAndServe(); err != nil {
 			log.Fatalf("Failed to start intelligent pool proxy server: %v", err)
-		}
-	} else if c.Server.UseGoRedisV2Fixed {
-		// Use final enhanced go-redis V2 Fixed server with proto package
-		server, err := proxy.NewGoRedisV2ServerFixed(proxyConfig)
-		if err != nil {
-			log.Fatalf("Failed to create go-redis V2 Fixed proxy server: %v", err)
-		}
-
-		logx.Info("🚀 go-redis V2 Fixed Enhanced Proxy (production-ready) starting...")
-		logx.Info("✅ HELLO command support for RESP3 compatibility")
-		logx.Info("✅ Perfect Mixed RESP + Inline Command Support")
-		logx.Info("✅ 100% Accurate Escape Character Handling")
-		logx.Info("🔗 Production-ready optimized connection pooling")
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Failed to start go-redis V2 Fixed proxy server: %v", err)
-		}
-	} else if c.Server.UseGoRedisV2 {
-		// Use enhanced go-redis V2 server with proto package
-		server, err := proxy.NewGoRedisV2Server(proxyConfig)
-		if err != nil {
-			log.Fatalf("Failed to create go-redis V2 proxy server: %v", err)
-		}
-
-		logx.Info("🚀 go-redis V2 Enhanced Proxy starting...")
-		logx.Info("✅ Proto package optimization enabled")
-		logx.Info("🔗 Session-based connection management")
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Failed to start go-redis V2 proxy server: %v", err)
-		}
-	} else if c.Server.UseGoRedis {
-		// Use go-redis server with session management
-		server, err := proxy.NewGoRedisServer(proxyConfig)
-		if err != nil {
-			log.Fatalf("Failed to create go-redis proxy server: %v", err)
-		}
-
-		logx.Info("go-redis Smart Proxy starting...")
-		logx.Info("✅ WATCH/MULTI/EXEC fully supported with session state")
-		logx.Info("🔗 Optimized connection pooling enabled")
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Failed to start go-redis proxy server: %v", err)
 		}
 	} else if c.Server.UseAffinity {
 		// Use connection affinity server for WATCH command support
