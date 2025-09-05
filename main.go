@@ -17,15 +17,12 @@ func main() {
 	fmt.Println("🚀 Redis Proxy Demo - Starting...")
 
 	// Parse command line arguments
-	var configFile = flag.String("c", "etc/config-affinity.yaml", "Configuration file path")
+	var configFile = flag.String("c", "etc/config-intelligent-pool.yaml", "Configuration file path")
 	flag.Parse()
 
 	// Load configuration
 	var c config.Config
-	if err := conf.Load(*configFile, &c); err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
-	}
-
+	conf.MustLoad(*configFile, &c)
 	// Initialize logging
 	logx.Info("Configuration loaded successfully")
 
@@ -106,14 +103,25 @@ func main() {
 		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
 		fmt.Printf("├── Transaction Support: ✅ MULTI/EXEC with Session State\n")
 		fmt.Printf("└── Smart Resource Management: ✅ Context-based Pooling\n")
+	} else if c.Server.UseOptimizedAffinity {
+		// Show optimized affinity-specific configuration
+		fmt.Printf("├── Max Client Connections: %d\n", c.ConnectionAffinity.MaxConnections)
+		fmt.Printf("├── Pre-Connection Pool Size: %d\n", c.ConnectionAffinity.PrePoolSize)
+		fmt.Printf("├── Prewarm Connections: %d\n", c.ConnectionAffinity.PrewarmConnections)
+		fmt.Printf("├── Idle Timeout: %s\n", c.ConnectionAffinity.IdleTimeout)
+		fmt.Printf("├── Connect Timeout: %s\n", c.ConnectionAffinity.ConnectTimeout)
+		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
+		fmt.Printf("├── Transaction Commands: ✅ MULTI/EXEC Supported\n")
+		fmt.Printf("└── Zero Connection Latency: ✅ Pre-Connection Pool\n")
 	} else if c.Server.UseAffinity {
-		// Show affinity-specific configuration
+		// Show traditional affinity-specific configuration
 		fmt.Printf("├── Max Client Connections: %d\n", c.Server.MaxConnections)
 		fmt.Printf("├── Idle Timeout: %s\n", proxyConfig.MaxIdleTime)
 		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
 		fmt.Printf("└── Transaction Commands: ✅ MULTI/EXEC Supported\n")
 	}
 
+	fmt.Printf("\n🚀 Starting Redis Proxy Server...path:%s,config :%+v \n", *configFile, c.IntelligentPool)
 	// Create appropriate server based on configuration
 	if c.Server.UseIntelligentPool {
 		// Parse IntelligentPool configuration durations
@@ -149,6 +157,34 @@ func main() {
 		logx.Info("🧠 Proto Library RESP Parsing")
 		if err := server.ListenAndServe(); err != nil {
 			log.Fatalf("Failed to start intelligent pool proxy server: %v", err)
+		}
+	} else if c.Server.UseOptimizedAffinity {
+		// Parse optimized affinity configuration durations
+		idleTimeout, _ := time.ParseDuration(c.ConnectionAffinity.IdleTimeout)
+		healthCheckInterval, _ := time.ParseDuration(c.ConnectionAffinity.HealthCheckInterval)
+
+		// Use optimized affinity server with pre-connection pool
+		server, err := proxy.NewOptimizedAffinityServerWithFullConfig(
+			proxyConfig,
+			proxyConfig.RedisAddr,
+			proxyConfig.RedisPassword,
+			c.ConnectionAffinity.MaxConnections,
+			c.ConnectionAffinity.PrePoolSize,
+			c.ConnectionAffinity.PrewarmConnections,
+			idleTimeout,
+			healthCheckInterval,
+		)
+		if err != nil {
+			log.Fatalf("Failed to create optimized affinity proxy server: %v", err)
+		}
+
+		logx.Info("🚀 优化的连接亲和性Redis代理启动中...")
+		logx.Info("✅ WATCH/MULTI/EXEC命令完全支持")
+		logx.Info("⚡ 零连接建立延迟 - 预连接池优化")
+		logx.Info(fmt.Sprintf("🏊 预连接池大小: %d", c.ConnectionAffinity.PrePoolSize))
+		logx.Info(fmt.Sprintf("🔥 预热连接数: %d", c.ConnectionAffinity.PrewarmConnections))
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start optimized affinity proxy server: %v", err)
 		}
 	} else if c.Server.UseAffinity {
 		// Use connection affinity server for WATCH command support

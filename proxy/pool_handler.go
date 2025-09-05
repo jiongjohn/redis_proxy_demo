@@ -28,6 +28,10 @@ type PoolHandler struct {
 	// 预生成的HELLO响应缓存
 	helloV2 string
 	helloV3 string
+	// 优化器
+	pingOptimizer     *PingOptimizer     // PING命令优化器
+	getsetOptimizer   *GetSetOptimizer   // GET/SET命令优化器
+	zeroCopyOptimizer *ZeroCopyOptimizer // 零拷贝优化器
 }
 
 // PoolHandlerConfig 池处理器配置
@@ -78,16 +82,48 @@ func NewPoolHandler(config PoolHandlerConfig) (*PoolHandler, error) {
 		config.CleanupInterval,
 	)
 
+	// 创建GET/SET优化器配置
+	getsetConfig := GetSetOptimizerConfig{
+		RedisAddr:      config.RedisAddr,
+		PoolSize:       100, // GET/SET专用连接池大小
+		MaxIdleTime:    30 * time.Second,
+		ReadTimeout:    2 * time.Second,
+		WriteTimeout:   2 * time.Second,
+		BufferSize:     8192,
+		EnablePipeline: true,
+		PipelineSize:   10,
+	}
+
+	// 创建零拷贝优化器配置
+	zeroCopyConfig := ZeroCopyConfig{
+		RedisAddr:    config.RedisAddr,
+		ConnCount:    50, // 预分配20个长连接
+		BufferSize:   8192,
+		ReadTimeout:  1 * time.Second,
+		WriteTimeout: 1 * time.Second,
+	}
+
+	// 创建零拷贝优化器
+	zeroCopyOptimizer, err := NewZeroCopyOptimizer(zeroCopyConfig)
+	if err != nil {
+		logger.Error(fmt.Sprintf("创建零拷贝优化器失败: %v", err))
+		// 如果创建失败，设置为nil，将使用普通优化器
+		zeroCopyOptimizer = nil
+	}
+
 	handler := &PoolHandler{
-		poolManager:    poolManager,
-		sessions:       make(map[net.Conn]*PoolClientSession),
-		sessionCounter: 0,
-		config:         config,
-		ctx:            ctx,
-		cancel:         cancel,
-		stats:          &HandlerStats{},
-		helloV2:        "+OK\r\n",
-		helloV3:        "",
+		poolManager:       poolManager,
+		sessions:          make(map[net.Conn]*PoolClientSession),
+		sessionCounter:    0,
+		config:            config,
+		ctx:               ctx,
+		cancel:            cancel,
+		stats:             &HandlerStats{},
+		helloV2:           "+OK\r\n",
+		helloV3:           "",
+		pingOptimizer:     NewPingOptimizer(config.RedisAddr, 50), // 创建PING优化器，50个连接
+		getsetOptimizer:   NewGetSetOptimizer(getsetConfig),       // 创建GET/SET优化器
+		zeroCopyOptimizer: zeroCopyOptimizer,                      // 零拷贝优化器
 	}
 
 	// 预热两个上下文（RESP2 和 RESP3），每个上下文至少建立2个连接
@@ -288,6 +324,36 @@ func (h *PoolHandler) handleCommandWithRaw(session *PoolClientSession, args []st
 	if commandName == "QUIT" {
 		h.handleQuit(session)
 		return nil
+	}
+
+	// 🚀 PING命令快速路径优化
+	if commandName == "PING" && len(args) == 1 {
+		// 对于简单的PING命令，使用优化路径
+		return h.pingOptimizer.HandlePingFast(session.ClientConn)
+	}
+
+	// 🚀 GET/SET命令快速路径优化
+	if session.GetState() == StateNormal { // 只在正常状态下使用快速路径
+		switch commandName {
+		case "GET":
+			if len(args) == 2 {
+				// 优先使用零拷贝优化器
+				if h.zeroCopyOptimizer != nil {
+					return h.zeroCopyOptimizer.HandleGetCommandZeroCopy(session.ClientConn, args[1])
+				}
+				// 回退到普通优化器
+				return h.getsetOptimizer.HandleGetCommand(session.ClientConn, args[1])
+			}
+		case "SET":
+			if len(args) == 3 {
+				// 优先使用零拷贝优化器
+				if h.zeroCopyOptimizer != nil {
+					return h.zeroCopyOptimizer.HandleSetCommandZeroCopy(session.ClientConn, args[1], args[2])
+				}
+				// 回退到普通优化器
+				return h.getsetOptimizer.HandleSetCommand(session.ClientConn, args[1], args[2])
+			}
+		}
 	}
 
 	// 分类命令

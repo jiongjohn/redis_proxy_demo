@@ -7,16 +7,17 @@ server:
   use_intelligent_pool: true
 
 intelligent_pool:
-  max_pool_size: 10
-  min_idle_conns: 1
-  max_idle_conns: 5
-  idle_timeout: "5m"
-  max_lifetime: "1h"
-  session_timeout: "30m"
-  cleanup_interval: "1m"
+  max_pool_size: 200
+  min_idle_conns: 20
+  max_idle_conns: 200
+  idle_timeout: "60s"
+  max_lifetime: "10m"
+  session_timeout: "5m"
+  cleanup_interval: "30s"
   stats_interval: "30s"
-  command_timeout: "30s"
+  command_timeout: "5s"
   max_retries: 3
+  connection_hold_time: "0s"
 
 redis:
   host: "127.0.0.1"
@@ -26,6 +27,9 @@ redis:
   connection_timeout: "5s"
   read_timeout: "3s"
   write_timeout: "3s"
+  pool_size: 200
+  min_idle_connections: 20
+  max_idle_connections: 200
 
 log:
   level: "info"

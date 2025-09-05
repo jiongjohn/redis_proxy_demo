@@ -1,0 +1,46 @@
+# Redis Proxy Configuration - Optimized Connection Affinity Mode
+# 优化的连接亲和性模式配置，使用预连接池减少连接建立开销
+
+server:
+  port: 6380
+  max_connections: 2000          # 增加最大连接数
+  read_timeout: 10s              # 减少读取超时
+  write_timeout: 10s             # 减少写入超时
+  idle_timeout: 120s             # 减少空闲超时
+  use_gnet: false
+  use_optimized_affinity: true   # ✅ 启用优化的连接亲和性（预连接池）
+
+# 优化的连接亲和性配置
+connection_affinity:
+  max_connections: 2000          # 最大并发客户端连接数
+  pre_pool_size: 200             # 预连接池大小
+  prewarm_connections: 50        # 预热连接数
+  idle_timeout: 2m               # 空闲连接超时（减少）
+  health_check_interval: 60s     # 健康检查间隔（增加）
+  buffer_size: 65536             # 64KB缓冲区（增加）
+  connect_timeout: 3s            # 连接超时
+  stats_interval: 30s            # 统计报告间隔
+
+redis:
+  host: "127.0.0.1"
+  port: 6379
+  password: ""                   # Redis密码
+  database: 0
+  connection_timeout: 3s         # 减少连接超时
+  read_timeout: 2s               # 减少读取超时
+  write_timeout: 2s              # 减少写入超时
+
+# 关闭非必要功能以提升性能
+cache:
+  enabled: false                 # 关闭缓存
+
+kafka:
+  enabled: false                 # 关闭Kafka
+
+monitoring:
+  enabled: false                 # 关闭监控以减少开销
+  big_key_threshold: 10MB
+  stats_interval: 60s
+  metrics_port: 8080
+  health_check_path: /health
+  metrics_path: /metrics
