@@ -24,55 +24,6 @@ type PoolServer struct {
 	wg       sync.WaitGroup
 }
 
-// NewPoolServer 创建新的池服务器
-func NewPoolServer(config Config) (*PoolServer, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// 创建池处理器配置
-	handlerConfig := PoolHandlerConfig{
-		RedisAddr:          config.RedisAddr,
-		RedisPassword:      config.RedisPassword,
-		MaxPoolSize:        int(config.PoolMaxActive),
-		MinIdleConns:       int(config.PoolMaxIdle / 4), // 动态计算最小空闲连接
-		MaxIdleConns:       int(config.PoolMaxIdle),
-		IdleTimeout:        config.MaxIdleTime,
-		MaxLifetime:        24 * time.Hour,            // 连接最大生命周期24小时
-		CleanupInterval:    5 * time.Minute,           // 每5分钟清理一次
-		SessionTimeout:     30 * time.Minute,          // 会话超时30分钟
-		CommandTimeout:     config.PoolConnTimeout,    // 命令超时
-		ConnectionHoldTime: 30 * time.Second,          // 非粘性连接保持时间30秒
-		DefaultDatabase:    0,                         // 默认数据库0
-		DefaultClientName:  "redis-proxy-pool-client", // 默认客户端名
-	}
-
-	// 设置默认值
-	if handlerConfig.MaxPoolSize == 0 {
-		handlerConfig.MaxPoolSize = 100 // 默认最大连接数
-	}
-	if handlerConfig.MaxIdleConns == 0 {
-		handlerConfig.MaxIdleConns = 20 // 默认最大空闲连接数
-	}
-	if handlerConfig.MinIdleConns == 0 {
-		handlerConfig.MinIdleConns = 5 // 默认最小空闲连接数
-	}
-	if handlerConfig.IdleTimeout == 0 {
-		handlerConfig.IdleTimeout = 5 * time.Minute // 默认空闲超时
-	}
-	if handlerConfig.CommandTimeout == 0 {
-		handlerConfig.CommandTimeout = 30 * time.Second // 默认命令超时
-	}
-
-	// 创建池处理器
-	handler := NewPoolHandler(handlerConfig)
-
-	return &PoolServer{
-		config:  config,
-		handler: handler,
-		ctx:     ctx,
-		cancel:  cancel,
-	}, nil
-}
-
 // NewPoolServerWithDetailedConfig 使用详细配置创建池服务器
 func NewPoolServerWithDetailedConfig(config Config,
 	maxPoolSize, minIdleConns, maxIdleConns int,
@@ -96,7 +47,13 @@ func NewPoolServerWithDetailedConfig(config Config,
 		DefaultClientName:  "redis-proxy-pool-client",
 	}
 
-	handler := NewPoolHandler(handlerConfig)
+	handler, err := NewPoolHandler(handlerConfig)
+	if err != nil {
+		fmt.Printf("创建池处理器失败: %w\n", err)
+		cancel()
+		return nil, fmt.Errorf("创建池处理器失败: %w", err)
+	}
+	fmt.Printf("创建池处理器成功\n")
 
 	return &PoolServer{
 		config:  config,

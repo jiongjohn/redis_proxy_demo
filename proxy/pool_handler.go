@@ -25,6 +25,9 @@ type PoolHandler struct {
 	cancel         context.CancelFunc              // 取消函数
 	mu             sync.RWMutex                    // 保护会话映射
 	stats          *HandlerStats                   // 处理器统计
+	// 预生成的HELLO响应缓存
+	helloV2 string
+	helloV3 string
 }
 
 // PoolHandlerConfig 池处理器配置
@@ -60,7 +63,7 @@ type HandlerStats struct {
 }
 
 // NewPoolHandler 创建新的池处理器
-func NewPoolHandler(config PoolHandlerConfig) *PoolHandler {
+func NewPoolHandler(config PoolHandlerConfig) (*PoolHandler, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// 创建连接池管理器
@@ -83,13 +86,51 @@ func NewPoolHandler(config PoolHandlerConfig) *PoolHandler {
 		ctx:            ctx,
 		cancel:         cancel,
 		stats:          &HandlerStats{},
+		helloV2:        "+OK\r\n",
+		helloV3:        "",
+	}
+
+	// 预热两个上下文（RESP2 和 RESP3），每个上下文至少建立2个连接
+	prewarm := func(protoVer int) error {
+		connCtx := &ConnectionContext{
+			Database:        config.DefaultDatabase,
+			Username:        "",
+			Password:        "",
+			ClientName:      config.DefaultClientName,
+			ProtocolVersion: protoVer,
+			TrackingEnabled: false,
+			TrackingOptions: "",
+		}
+		// 创建或获取池，并获取两个连接再归还，确保可用
+		for i := 0; i < 2; i++ {
+			conn, err := poolManager.GetConnection(connCtx, fmt.Sprintf("prewarm_%d_%d", protoVer, i))
+			if err != nil {
+				return fmt.Errorf("预热协议 %d 连接失败: %w", protoVer, err)
+			}
+			poolManager.ReturnConnection(conn, fmt.Sprintf("prewarm_%d_%d", protoVer, i))
+		}
+		return nil
+	}
+
+	if err := prewarm(2); err != nil {
+		logger.Error(fmt.Sprintf("预热RESP2失败: %v", err))
+		return nil, err
+	}
+	if err := prewarm(3); err != nil {
+		logger.Error(fmt.Sprintf("预热RESP3失败: %v", err))
+		return nil, err
+	}
+
+	// 从连接池管理器中读取并缓存 HELLO 响应（特别是 RESP3）
+	if v3 := poolManager.GetHelloResponse(3); v3 != "" {
+		handler.helloV3 = v3
 	}
 
 	// 启动会话清理协程
 	go handler.sessionCleanupLoop()
 	go handler.statsReporter()
 
-	return handler
+	return handler, nil
 }
 
 // Handle 处理客户端连接
@@ -119,12 +160,6 @@ func (h *PoolHandler) Handle(ctx context.Context, clientConn net.Conn) {
 		default:
 		}
 
-		// 移除客户端连接的读取超时，允许长时间空闲连接
-		// Redis客户端通常保持长连接，不应该因为暂时不发送命令而被强制断开
-		// if h.config.CommandTimeout > 0 {
-		// 	clientConn.SetReadDeadline(time.Now().Add(h.config.CommandTimeout))
-		// }
-
 		// 解析命令并保存原始数据
 		args, rawData, err := h.parseCommandWithRaw(reader)
 		if err != nil {
@@ -139,14 +174,6 @@ func (h *PoolHandler) Handle(ctx context.Context, clientConn net.Conn) {
 		if len(args) == 0 {
 			continue
 		}
-
-		// 获取redis连接
-		//redisConn, err := h.getRedisConnectionByArgs(session, args)
-		//if err != nil {
-		//	logger.Error(fmt.Sprintf("获取Redis连接失败: %v", err))
-		//	h.sendError(clientConn, err)
-		//	return
-		//}
 
 		// 处理命令（传入原始数据）
 		err = h.handleCommandWithRaw(session, args, rawData)
@@ -170,17 +197,20 @@ func (h *PoolHandler) createSession(clientConn net.Conn) *PoolClientSession {
 	sessionID := fmt.Sprintf("pool_session_%d", h.sessionCounter)
 
 	// 创建默认连接上下文
-	context := &ConnectionContext{
+	connCtx := &ConnectionContext{
 		Database:        h.config.DefaultDatabase,
 		Username:        "", // TODO: 支持用户名
+		Password:        "",
 		ClientName:      h.config.DefaultClientName,
 		ProtocolVersion: 2, // 默认RESP2
+		TrackingEnabled: false,
+		TrackingOptions: "",
 	}
 
 	session := &PoolClientSession{
 		ID:               sessionID,
 		ClientConn:       clientConn,
-		Context:          context,
+		Context:          connCtx,
 		State:            StateNormal,
 		CurrentRedisConn: nil,
 		CreatedAt:        time.Now(),
@@ -197,7 +227,7 @@ func (h *PoolHandler) createSession(clientConn net.Conn) *PoolClientSession {
 	h.stats.SessionsCreated++
 	h.stats.mu.Unlock()
 
-	logger.Debug(fmt.Sprintf("创建会话: %s, 上下文: %s", sessionID, context.Hash()))
+	logger.Debug(fmt.Sprintf("创建会话: %s, 上下文: %s", sessionID, connCtx.Hash()))
 	return session
 }
 
@@ -235,67 +265,6 @@ func (h *PoolHandler) cleanupSession(clientConn net.Conn) {
 	h.stats.mu.Unlock()
 }
 
-// getRedisConnectionByArgs
-func (h *PoolHandler) getRedisConnectionByArgs(session *PoolClientSession, args []string) (*PooledConnection, error) {
-	if len(args) == 0 {
-		return nil, fmt.Errorf("空命令")
-	}
-
-	commandName := strings.ToUpper(args[0])
-	session.SetLastCommand(commandName)
-	session.IncrementCommandCount()
-	session.UpdateLastActivity() // 更新最后活动时间
-
-	// 更新统计
-	h.stats.mu.Lock()
-	h.stats.CommandsProcessed++
-	h.stats.LastActivity = time.Now()
-	h.stats.mu.Unlock()
-
-	logger.Debug(fmt.Sprintf("📝 会话 %s 执行命令: %s %v", session.ID, commandName, args[1:]))
-
-	// 分类命令
-	classifier := h.poolManager.GetClassifier()
-	cmdType := classifier.ClassifyCommand(commandName)
-
-	// 更新命令类型统计
-	h.stats.mu.Lock()
-	switch cmdType {
-	case NORMAL:
-		h.stats.NormalCommands++
-		return h.getRedisConnection(session)
-	case INIT:
-		h.stats.InitCommands++
-		return h.getInitCommandRedisConn(session, args)
-	case SESSION:
-		h.stats.SessionCommands++
-		return h.getStickyRedisConnection(session)
-	}
-	return h.getRedisConnection(session)
-}
-
-// getInitCommandRedisConn
-func (h *PoolHandler) getInitCommandRedisConn(session *PoolClientSession, args []string) (*PooledConnection, error) {
-	commandName := strings.ToUpper(args[0])
-
-	// 特殊处理一些初始化命令（这些需要解析参数）
-	switch commandName {
-	case "SELECT":
-		return h.handleSelectRedisConn(session, args)
-	case "AUTH":
-		return h.getRedisConnection(session)
-	case "HELLO":
-		return h.handleHelloRedisConn(session, args)
-	case "CLIENT":
-		if len(args) > 1 && strings.ToUpper(args[1]) == "SETNAME" {
-			return h.handleClientSetNameRedisConn(session, args)
-		}
-	}
-
-	// 其他初始化命令直接转发原始数据
-	return h.getRedisConnection(session)
-}
-
 // handleCommandWithRaw 处理Redis命令（带原始数据）
 func (h *PoolHandler) handleCommandWithRaw(session *PoolClientSession, args []string, rawData []byte) error {
 	if len(args) == 0 {
@@ -314,6 +283,12 @@ func (h *PoolHandler) handleCommandWithRaw(session *PoolClientSession, args []st
 	h.stats.mu.Unlock()
 
 	logger.Debug(fmt.Sprintf("📝 会话 %s 执行命令: %s %v", session.ID, commandName, args[1:]))
+
+	// 特殊处理 QUIT：本地回复并断开客户端TCP，不转发到Redis
+	if commandName == "QUIT" {
+		h.handleQuit(session)
+		return nil
+	}
 
 	// 分类命令
 	classifier := h.poolManager.GetClassifier()
@@ -346,41 +321,179 @@ func (h *PoolHandler) handleCommandWithRaw(session *PoolClientSession, args []st
 
 // handleNormalCommandWithRaw 处理普通命令（带原始数据）
 func (h *PoolHandler) handleNormalCommandWithRaw(session *PoolClientSession, args []string, rawData []byte) error {
-	// 获取Redis连接
-	redisConn, err := h.getRedisConnection(session)
+	// 根据会话状态选择连接类型：会话状态使用粘性连接
+	var redisConn *PooledConnection
+	var err error
+	if session.GetState() != StateNormal {
+		redisConn, err = h.getStickyRedisConnection(session)
+	} else {
+		redisConn, err = h.getRedisConnection(session)
+	}
 	if err != nil {
 		return fmt.Errorf("获取Redis连接失败: %w", err)
 	}
 
+	// 如果是临时连接（非粘性），执行完后归还
+	defer func() {
+		if redisConn.StickyClient == "" || redisConn.StickyClient != session.ID {
+			h.poolManager.ReturnConnection(redisConn, session.ID)
+			session.SetRedisConnection(nil)
+		}
+	}()
+
 	// 转发命令到Redis（使用原始数据）
-	return h.forwardCommandRaw(session, redisConn, rawData)
+	err = h.forwardCommandRaw(session, redisConn, rawData)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // handleInitCommandWithRaw 处理初始化命令（带原始数据）
 func (h *PoolHandler) handleInitCommandWithRaw(session *PoolClientSession, args []string, rawData []byte) error {
 	commandName := strings.ToUpper(args[0])
 
-	// 特殊处理一些初始化命令（这些需要解析参数）
+	// 本地处理初始化命令：仅更新上下文并返回OK/HELLO响应，不获取连接
 	switch commandName {
 	case "SELECT":
-		return h.handleSelect(session, args, rawData)
+		return h.handleInitSelect(session, args)
 	case "AUTH":
-		return h.handleAuth(session, args, rawData)
+		return h.handleInitAuth(session, args)
 	case "HELLO":
-		return h.handleHello(session, args, rawData)
+		return h.handleInitHello(session, args)
 	case "CLIENT":
-		if len(args) > 1 && strings.ToUpper(args[1]) == "SETNAME" {
-			return h.handleClientSetName(session, args, rawData)
+		return h.handleInitClient(session, args)
+	default:
+		// 其他初始化命令：统一返回OK（简化）
+		h.sendSimpleString(session.ClientConn, "OK")
+		return nil
+	}
+}
+
+// handleInitSelect 处理 INIT: SELECT
+func (h *PoolHandler) handleInitSelect(session *PoolClientSession, args []string) error {
+	if len(args) != 2 {
+		h.sendError(session.ClientConn, fmt.Errorf("SELECT命令参数错误"))
+		return nil
+	}
+	var dbNum int
+	if _, err := fmt.Sscanf(args[1], "%d", &dbNum); err != nil {
+		h.sendError(session.ClientConn, fmt.Errorf("无效的数据库编号: %s", args[1]))
+		return nil
+	}
+	session.mu.Lock()
+	session.Context.Database = dbNum
+	session.mu.Unlock()
+	h.resetSessionConnection(session)
+	h.sendSimpleString(session.ClientConn, "OK")
+	return nil
+}
+
+// handleInitAuth 处理 INIT: AUTH
+func (h *PoolHandler) handleInitAuth(session *PoolClientSession, args []string) error {
+	// AUTH <password> 或 AUTH <username> <password>
+	if len(args) == 2 {
+		session.mu.Lock()
+		session.Context.Username = ""
+		session.Context.Password = args[1]
+		session.mu.Unlock()
+		h.resetSessionConnection(session)
+		h.sendSimpleString(session.ClientConn, "OK")
+		return nil
+	}
+	if len(args) == 3 {
+		session.mu.Lock()
+		session.Context.Username = args[1]
+		session.Context.Password = args[2]
+		session.mu.Unlock()
+		h.resetSessionConnection(session)
+		h.sendSimpleString(session.ClientConn, "OK")
+		return nil
+	}
+	h.sendError(session.ClientConn, fmt.Errorf("AUTH命令参数错误"))
+	return nil
+}
+
+// handleInitHello 处理 INIT: HELLO
+func (h *PoolHandler) handleInitHello(session *PoolClientSession, args []string) error {
+	// HELLO [protover [AUTH username password] [SETNAME clientname]]
+	if len(args) > 1 {
+		if args[1] == "3" {
+			session.mu.Lock()
+			session.Context.ProtocolVersion = 3
+			session.mu.Unlock()
+		}
+		// 解析可选项
+		for i := 2; i < len(args); i++ {
+			switch strings.ToUpper(args[i]) {
+			case "AUTH":
+				if i+2 < len(args) {
+					session.mu.Lock()
+					session.Context.Username = args[i+1]
+					session.Context.Password = args[i+2]
+					session.mu.Unlock()
+					h.resetSessionConnection(session)
+					i += 2
+				}
+			case "SETNAME":
+				if i+1 < len(args) {
+					session.mu.Lock()
+					session.Context.ClientName = args[i+1]
+					session.mu.Unlock()
+					h.resetSessionConnection(session)
+					i += 1
+				}
+			}
 		}
 	}
+	// 返回HELLO响应（简化）
+	h.sendHelloResponse(session)
+	return nil
+}
 
-	// 其他初始化命令直接转发原始数据
-	redisConn, err := h.getRedisConnection(session)
-	if err != nil {
-		return fmt.Errorf("获取Redis连接失败: %w", err)
+// handleInitClient 处理 INIT: CLIENT 子命令
+func (h *PoolHandler) handleInitClient(session *PoolClientSession, args []string) error {
+	if len(args) < 2 {
+		h.sendSimpleString(session.ClientConn, "OK")
+		return nil
 	}
-
-	return h.forwardCommandRaw(session, redisConn, rawData)
+	sub := strings.ToUpper(args[1])
+	switch sub {
+	case "SETNAME":
+		if len(args) >= 3 {
+			session.mu.Lock()
+			session.Context.ClientName = args[2]
+			session.mu.Unlock()
+			h.resetSessionConnection(session)
+			h.sendSimpleString(session.ClientConn, "OK")
+			return nil
+		}
+		h.sendError(session.ClientConn, fmt.Errorf("CLIENT SETNAME 参数错误"))
+		return nil
+	case "TRACKING":
+		if len(args) > 2 {
+			flag := strings.ToUpper(args[2])
+			session.mu.Lock()
+			session.Context.TrackingEnabled = (flag == "ON")
+			session.Context.TrackingOptions = strings.Join(args[3:], " ")
+			session.mu.Unlock()
+			h.resetSessionConnection(session)
+			h.sendSimpleString(session.ClientConn, "OK")
+			return nil
+		}
+		h.sendError(session.ClientConn, fmt.Errorf("CLIENT TRACKING 参数错误"))
+		return nil
+	case "SETINFO":
+		// go-redis 会发送：CLIENT SETINFO LIB-NAME <name> [LIB-VER <ver>]
+		// 我们本地接受并返回OK，不触发连接获取
+		h.sendSimpleString(session.ClientConn, "OK")
+		return nil
+	default:
+		// 其他子命令统一OK
+		h.sendSimpleString(session.ClientConn, "OK")
+		return nil
+	}
 }
 
 // handleSessionCommandWithRaw 处理会话命令（带原始数据）
@@ -395,7 +508,8 @@ func (h *PoolHandler) handleSessionCommandWithRaw(session *PoolClientSession, ar
 
 	// 更新连接状态
 	classifier := h.poolManager.GetClassifier()
-	newState := classifier.DetermineStateTransition(session.GetState(), commandName)
+	prevState := session.GetState()
+	newState := classifier.DetermineStateTransition(prevState, commandName)
 	session.UpdateState(newState)
 	redisConn.UpdateState(newState)
 
@@ -405,8 +519,8 @@ func (h *PoolHandler) handleSessionCommandWithRaw(session *PoolClientSession, ar
 		return err
 	}
 
-	// 如果会话结束，释放粘性连接
-	if newState == StateNormal && session.GetState() != StateNormal {
+	// 如果会话结束（从非Normal回到Normal），释放粘性连接
+	if prevState != StateNormal && newState == StateNormal {
 		h.poolManager.ReleaseConnection(redisConn, session.ID)
 		session.SetRedisConnection(nil)
 	}
@@ -469,18 +583,16 @@ func (h *PoolHandler) forwardCommandRaw(session *PoolClientSession, redisConn *P
 	// 直接转发Redis响应到客户端（不进行协议解析）
 	buffer := make([]byte, 4096)
 
-	// 设置读取超时
+	// 设置读取超时（首包较长，给足时间；后续缩短）
 	redisConn.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	// Redis响应通常可以一次读取完成
-	// 对于大响应，使用循环读取直到超时或EOF
 	totalBytes := 0
+	firstRead := true
 
 	for {
 		n, err := redisConn.Conn.Read(buffer)
 		if err != nil {
 			if err == io.EOF {
-				// EOF表示Redis连接关闭，正常退出
 				break
 			}
 			// 对于超时错误，如果已经读取到数据，则认为响应完成
@@ -492,31 +604,22 @@ func (h *PoolHandler) forwardCommandRaw(session *PoolClientSession, redisConn *P
 
 		if n > 0 {
 			totalBytes += n
-			// 直接转发到客户端
 			_, err = session.ClientConn.Write(buffer[:n])
 			if err != nil {
 				return fmt.Errorf("发送响应到客户端失败: %w", err)
 			}
 
-			// 设置更短的超时来检查是否还有更多数据
-			// 大多数Redis响应都能一次读取完成
-			//redisConn.Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			// 首次读到数据后，改为较短的尾包等待，尽快返回给客户端
+			if firstRead {
+				firstRead = false
+				redisConn.Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			}
 		} else {
-			// 没有读取到数据，可能响应已完成
 			break
 		}
 	}
 
 	return nil
-}
-
-// buildRESPCommand 构建RESP格式命令
-func (h *PoolHandler) buildRESPCommand(args []string) string {
-	command := fmt.Sprintf("*%d\r\n", len(args))
-	for _, arg := range args {
-		command += fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
-	}
-	return command
 }
 
 // parseCommandWithRaw 解析客户端命令并保存原始数据
@@ -597,137 +700,6 @@ func (h *PoolHandler) convertToArgs(cmd interface{}) ([]string, error) {
 
 // 特殊命令处理器
 
-// handleSelectRedisConn 处理SELECT命令
-func (h *PoolHandler) handleSelectRedisConn(session *PoolClientSession, args []string) (*PooledConnection, error) {
-	if len(args) != 2 {
-		return nil, fmt.Errorf("SELECT命令参数错误")
-	}
-
-	// 解析数据库编号
-	var dbNum int
-	if _, err := fmt.Sscanf(args[1], "%d", &dbNum); err != nil {
-		return nil, fmt.Errorf("无效的数据库编号: %s", args[1])
-	}
-
-	// 更新会话上下文
-	session.mu.Lock()
-	session.Context.Database = dbNum
-	session.mu.Unlock()
-
-	// 如果有当前连接，需要释放并获取新的连接（不同DB的连接不能复用）
-	if existingConn := session.GetRedisConnection(); existingConn != nil {
-		h.poolManager.ReturnConnection(existingConn, session.ID)
-		session.SetRedisConnection(nil)
-	}
-
-	// 获取新连接并执行SELECT
-	return h.getRedisConnection(session)
-}
-
-// handleSelect 处理SELECT命令
-func (h *PoolHandler) handleSelect(session *PoolClientSession, args []string, rawData []byte) error {
-	if len(args) != 2 {
-		return fmt.Errorf("SELECT命令参数错误")
-	}
-
-	// 解析数据库编号
-	var dbNum int
-	if _, err := fmt.Sscanf(args[1], "%d", &dbNum); err != nil {
-		return fmt.Errorf("无效的数据库编号: %s", args[1])
-	}
-
-	// 更新会话上下文
-	session.mu.Lock()
-	session.Context.Database = dbNum
-	session.mu.Unlock()
-
-	// 如果有当前连接，需要释放并获取新的连接（不同DB的连接不能复用）
-	if existingConn := session.GetRedisConnection(); existingConn != nil {
-		h.poolManager.ReturnConnection(existingConn, session.ID)
-		session.SetRedisConnection(nil)
-	}
-
-	// 获取新连接并执行SELECT
-	redisConn, err := h.getRedisConnection(session)
-	if err != nil {
-		return err
-	}
-
-	return h.forwardCommandRaw(session, redisConn, rawData)
-}
-
-// handleAuth 处理AUTH命令
-func (h *PoolHandler) handleAuth(session *PoolClientSession, args []string, rawData []byte) error {
-	// AUTH命令会影响连接的认证状态，需要特殊处理
-	// 这里简化处理，实际应该更新连接上下文
-	redisConn, err := h.getRedisConnection(session)
-	if err != nil {
-		return err
-	}
-
-	return h.forwardCommandRaw(session, redisConn, rawData)
-}
-
-// handleHelloRedisConn 处理HELLO命令
-func (h *PoolHandler) handleHelloRedisConn(session *PoolClientSession, args []string) (*PooledConnection, error) {
-	// HELLO命令用于协议协商，需要更新协议版本
-	if len(args) > 1 {
-		if args[1] == "3" {
-			session.mu.Lock()
-			session.Context.ProtocolVersion = 3
-			session.mu.Unlock()
-		}
-	}
-
-	return h.getRedisConnection(session)
-}
-
-// handleHello 处理HELLO命令
-func (h *PoolHandler) handleHello(session *PoolClientSession, args []string, rawData []byte) error {
-	// HELLO命令用于协议协商，需要更新协议版本
-	if len(args) > 1 {
-		if args[1] == "3" {
-			session.mu.Lock()
-			session.Context.ProtocolVersion = 3
-			session.mu.Unlock()
-		}
-	}
-
-	redisConn, err := h.getRedisConnection(session)
-	if err != nil {
-		return err
-	}
-
-	return h.forwardCommandRaw(session, redisConn, rawData)
-}
-
-// handleClientSetNameRedisConn 处理CLIENT SETNAME命令
-func (h *PoolHandler) handleClientSetNameRedisConn(session *PoolClientSession, args []string) (*PooledConnection, error) {
-	if len(args) >= 3 {
-		session.mu.Lock()
-		session.Context.ClientName = args[2]
-		session.mu.Unlock()
-	}
-
-	return h.getRedisConnection(session)
-}
-
-// handleClientSetName 处理CLIENT SETNAME命令
-func (h *PoolHandler) handleClientSetName(session *PoolClientSession, args []string, rawData []byte) error {
-	if len(args) >= 3 {
-		session.mu.Lock()
-		session.Context.ClientName = args[2]
-		session.mu.Unlock()
-	}
-
-	redisConn, err := h.getRedisConnection(session)
-	if err != nil {
-		return err
-	}
-
-	return h.forwardCommandRaw(session, redisConn, rawData)
-}
-
 // 辅助函数
 
 // sendError 发送错误响应给客户端
@@ -738,6 +710,46 @@ func (h *PoolHandler) sendError(conn net.Conn, err error) {
 	h.stats.mu.Lock()
 	h.stats.ErrorsEncountered++
 	h.stats.mu.Unlock()
+}
+
+// sendSimpleString 发送简单字符串回复（+OK）
+func (h *PoolHandler) sendSimpleString(conn net.Conn, s string) {
+	response := fmt.Sprintf("+%s\r\n", s)
+	conn.Write([]byte(response))
+}
+
+// sendHelloResponse 发送简化的HELLO响应
+func (h *PoolHandler) sendHelloResponse(session *PoolClientSession) {
+	// 如果协商为RESP3，返回一个标准化的HELLO map响应；否则返回+OK
+	session.mu.RLock()
+	pv := session.Context.ProtocolVersion
+	session.mu.RUnlock()
+	if pv == 3 {
+		if h.helloV3 == "" {
+			// 尝试从poolManager获取一次
+			h.helloV3 = h.poolManager.GetHelloResponse(3)
+		}
+		if h.helloV3 != "" {
+			session.ClientConn.Write([]byte(h.helloV3))
+			return
+		} else {
+			// 如果实在获取不到 就模拟一个给客户端
+			version := "7.0.0"
+			mode := "standalone"
+			role := "master"
+			resp := ""
+			resp += "%7\r\n"
+			resp += "$6\r\nserver\r\n$5\r\nredis\r\n"
+			resp += "$7\r\nversion\r\n$" + fmt.Sprintf("%d\r\n%s\r\n", len(version), version)
+			resp += "$5\r\nproto\r\n:3\r\n"
+			resp += "$2\r\nid\r\n:1\r\n"
+			resp += "$4\r\nmode\r\n$" + fmt.Sprintf("%d\r\n%s\r\n", len(mode), mode)
+			resp += "$4\r\nrole\r\n$" + fmt.Sprintf("%d\r\n%s\r\n", len(role), role)
+			resp += "$7\r\nmodules\r\n*0\r\n"
+			session.ClientConn.Write([]byte(resp))
+		}
+	}
+	h.sendSimpleString(session.ClientConn, "OK")
 }
 
 // isConnectionClosed 检查是否是连接关闭错误
@@ -786,7 +798,8 @@ func (h *PoolHandler) cleanupExpiredSessions() {
 
 	for _, session := range h.sessions {
 		session.mu.RLock()
-		if time.Since(session.CreatedAt) > h.config.SessionTimeout {
+		// tcp 链接超过SessionTimeout不操作的删除
+		if time.Since(session.LastActivity) > h.config.SessionTimeout {
 			expiredSessions = append(expiredSessions, session)
 		}
 		session.mu.RUnlock()
@@ -860,6 +873,11 @@ func (h *PoolHandler) reportStats() {
 
 	logger.Info(fmt.Sprintf("📊 连接池统计 - 池数量: %d, 创建: %d, 关闭: %d",
 		poolStats.PoolCount, poolStats.PoolsCreated, poolStats.PoolsClosed))
+
+	// 新增: 聚合连接统计
+	agg := h.poolManager.GetAggregateConnectionStats()
+	logger.Info(fmt.Sprintf("🏊 连接汇总 - 池:%d, 总连接:%d, 活跃:%d, 空闲:%d, 每池上限:%d, 总容量:%d",
+		agg.NumPools, agg.TotalConnections, agg.ActiveConnections, agg.IdleConnections, agg.MaxPerPool, agg.TotalCapacity))
 }
 
 // Close 关闭处理器
@@ -910,4 +928,26 @@ func (h *PoolHandler) GetStats() HandlerStats {
 // GetPoolManagerStats 获取池管理器统计信息
 func (h *PoolHandler) GetPoolManagerStats() PoolManagerStats {
 	return h.poolManager.GetStats()
+}
+
+func (h *PoolHandler) resetSessionConnection(session *PoolClientSession) {
+	if existingConn := session.GetRedisConnection(); existingConn != nil {
+		h.poolManager.ReturnConnection(existingConn, session.ID)
+		session.SetRedisConnection(nil)
+	}
+}
+
+func (h *PoolHandler) handleQuit(session *PoolClientSession) {
+	// Redis 语义：返回 +OK 然后关闭连接
+	h.sendSimpleString(session.ClientConn, "OK")
+	// 立即释放/归还当前会话上的Redis连接
+	if redisConn := session.GetRedisConnection(); redisConn != nil {
+		if redisConn.StickyClient == session.ID {
+			h.poolManager.ReleaseConnection(redisConn, session.ID)
+		} else {
+			h.poolManager.ReturnConnection(redisConn, session.ID)
+		}
+		session.SetRedisConnection(nil)
+	}
+	_ = session.ClientConn.Close()
 }

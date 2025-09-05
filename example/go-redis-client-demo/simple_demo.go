@@ -28,22 +28,23 @@ func simpleTest() {
 		MinIdleConns: 1,
 		MaxIdleConns: 1,
 	})
+	fmt.Printf("rdb success %v", rdb)
 
 	ctx := context.Background()
 
 	fmt.Println("\n🔍 1. 基础连接测试")
-
+	var err error
 	// 1. PING 测试
 	fmt.Print("   PING 测试... ")
-	pong, err := rdb.Ping(ctx).Result()
-	if err != nil {
-		fmt.Printf("❌ 失败: %v\n", err)
-	} else {
-		fmt.Printf("✅ 成功: %s\n", pong)
-	}
-
-	fmt.Println("\n📝 2. 基础 SET/GET 测试")
-
+	//pong, err := rdb.Ping(ctx).Result()
+	//if err != nil {
+	//	fmt.Printf("❌ 失败: %v\n", err)
+	//} else {
+	//	fmt.Printf("✅ 成功: %s\n", pong)
+	//}
+	//
+	//fmt.Println("\n📝 2. 基础 SET/GET 测试")
+	//
 	// 2. SET 测试
 	fmt.Print("   SET test:key hello... ")
 	err = rdb.Set(ctx, "test:key", "hello", 0).Err()

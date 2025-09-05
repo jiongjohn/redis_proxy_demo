@@ -73,7 +73,7 @@ func (s *PoolClientSession) GetCommandCount() int64 {
 func (s *PoolClientSession) IsExpired(timeout time.Duration) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return time.Since(s.CreatedAt) > timeout
+	return time.Since(s.LastActivity) > timeout
 }
 
 // ClearRedisConnection 清除Redis连接引用

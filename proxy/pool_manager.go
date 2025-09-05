@@ -15,14 +15,18 @@ import (
 type ConnectionContext struct {
 	Database        int    // 数据库编号
 	Username        string // 用户名（Redis 6.0+）
+	Password        string // 密码（Redis 6.0+ 支持用户名/密码）
 	ClientName      string // 客户端名称
 	ProtocolVersion int    // 协议版本
+	// 客户端跟踪（RESP3 Client Tracking）简单支持
+	TrackingEnabled bool   // 是否开启跟踪
+	TrackingOptions string // 额外跟踪选项（简化存储原始参数）
 }
 
 // Hash 生成上下文的唯一标识
 func (ctx *ConnectionContext) Hash() string {
-	data := fmt.Sprintf("db:%d|user:%s|name:%s|proto:%d",
-		ctx.Database, ctx.Username, ctx.ClientName, ctx.ProtocolVersion)
+	data := fmt.Sprintf("db:%d|user:%s|pass:%s|name:%s|proto:%d|track:%t|topt:%s",
+		ctx.Database, ctx.Username, ctx.Password, ctx.ClientName, ctx.ProtocolVersion, ctx.TrackingEnabled, ctx.TrackingOptions)
 	return fmt.Sprintf("%x", md5.Sum([]byte(data)))
 }
 
@@ -82,6 +86,7 @@ type ConnectionPool struct {
 	redisPassword string               // Redis密码
 	mu            sync.RWMutex         // 保护连接列表
 	stats         *ConnectionPoolStats // 池统计信息
+	lastHelloResp string               // 最近一次HELLO响应（用于RESP3缓存）
 }
 
 // ConnectionPoolStats 连接池统计
@@ -253,11 +258,25 @@ func (pool *ConnectionPool) createConnection() (*PooledConnection, error) {
 		return nil, fmt.Errorf("连接Redis失败: %w", err)
 	}
 
-	// 执行Redis认证（如果需要）
-	if pool.redisPassword != "" {
-		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n",
-			len(pool.redisPassword), pool.redisPassword)
+	// 执行Redis认证（优先使用连接上下文中的凭证，其次使用全局密码）
+	if pool.context.Username != "" || pool.context.Password != "" || pool.redisPassword != "" {
+		var authCmd string
+		if pool.context.Username != "" {
+			// AUTH <username> <password>
+			pwd := pool.context.Password
+			authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+				len(pool.context.Username), pool.context.Username,
+				len(pwd), pwd)
+		} else {
+			// 单参数AUTH，优先使用会话密码，否则使用全局密码
+			pwd := pool.context.Password
+			if pwd == "" {
+				pwd = pool.redisPassword
+			}
+			authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(pwd), pwd)
+		}
 
+		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		_, err = conn.Write([]byte(authCmd))
 		if err != nil {
 			conn.Close()
@@ -266,6 +285,7 @@ func (pool *ConnectionPool) createConnection() (*PooledConnection, error) {
 
 		// 读取AUTH响应
 		buffer := make([]byte, 1024)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, err := conn.Read(buffer)
 		if err != nil {
 			conn.Close()
@@ -275,7 +295,7 @@ func (pool *ConnectionPool) createConnection() (*PooledConnection, error) {
 		response := string(buffer[:n])
 		if !containsOK(response) {
 			conn.Close()
-			return nil, fmt.Errorf("Redis认证失败: %s", response)
+			return nil, fmt.Errorf("redis认证失败: %s", response)
 		}
 	}
 
@@ -300,25 +320,42 @@ func (pool *ConnectionPool) createConnection() (*PooledConnection, error) {
 
 // applyContext 应用连接上下文
 func (pool *ConnectionPool) applyContext(conn net.Conn) error {
+	// 如果要求RESP3，先发送 HELLO 3
+	if pool.context.ProtocolVersion == 3 {
+		helloCmd := "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, err := conn.Write([]byte(helloCmd))
+		if err != nil {
+			return fmt.Errorf("发送HELLO 3命令失败: %w", err)
+		}
+		buffer := make([]byte, 4096)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := conn.Read(buffer)
+		if err != nil {
+			return fmt.Errorf("读取HELLO 3响应失败: %w", err)
+		}
+		// 注意：调用方在创建连接时已持有 pool.mu，这里直接写入避免死锁
+		pool.lastHelloResp = string(buffer[:n])
+	}
+
 	// 设置数据库
 	if pool.context.Database != 0 {
 		selectCmd := fmt.Sprintf("*2\r\n$6\r\nSELECT\r\n$%d\r\n%d\r\n",
 			len(fmt.Sprintf("%d", pool.context.Database)), pool.context.Database)
-
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		_, err := conn.Write([]byte(selectCmd))
 		if err != nil {
 			return fmt.Errorf("发送SELECT命令失败: %w", err)
 		}
-
 		buffer := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, err := conn.Read(buffer)
 		if err != nil {
 			return fmt.Errorf("读取SELECT响应失败: %w", err)
 		}
-
 		response := string(buffer[:n])
 		if !containsOK(response) {
-			return fmt.Errorf("SELECT命令失败: %s", response)
+			return fmt.Errorf("select命令失败: %s", response)
 		}
 	}
 
@@ -326,25 +363,55 @@ func (pool *ConnectionPool) applyContext(conn net.Conn) error {
 	if pool.context.ClientName != "" {
 		nameCmd := fmt.Sprintf("*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$%d\r\n%s\r\n",
 			len(pool.context.ClientName), pool.context.ClientName)
-
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		_, err := conn.Write([]byte(nameCmd))
 		if err != nil {
 			return fmt.Errorf("发送CLIENT SETNAME命令失败: %w", err)
 		}
-
 		buffer := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, err := conn.Read(buffer)
 		if err != nil {
 			return fmt.Errorf("读取CLIENT SETNAME响应失败: %w", err)
 		}
-
 		response := string(buffer[:n])
 		if !containsOK(response) {
-			return fmt.Errorf("CLIENT SETNAME命令失败: %s", response)
+			return fmt.Errorf("client setname命令失败: %s", response)
 		}
 	}
 
+	// 简单支持开启客户端跟踪（仅ON，无复杂参数处理）
+	if pool.context.TrackingEnabled {
+		trackingCmd := "*3\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n"
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, err := conn.Write([]byte(trackingCmd))
+		if err != nil {
+			return fmt.Errorf("发送CLIENT TRACKING ON命令失败: %w", err)
+		}
+		buffer := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := conn.Read(buffer)
+		if err != nil {
+			return fmt.Errorf("读取CLIENT TRACKING ON响应失败: %w", err)
+		}
+		response := string(buffer[:n])
+		if !containsOK(response) {
+			return fmt.Errorf("client tracking on命令失败: %s", response)
+		}
+	}
+	fmt.Printf("applyContext完成\n")
+
+	// 清除deadline
+	_ = conn.SetDeadline(time.Time{})
+
 	return nil
+}
+
+// GetHelloResponse 获取某协议版本的HELLO响应缓存
+func (pool *ConnectionPool) GetHelloResponse() string {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	return pool.lastHelloResp
 }
 
 // Cleanup 清理过期和空闲连接
@@ -468,6 +535,16 @@ type PoolManager struct {
 	ctx             context.Context            // 上下文
 	cancel          context.CancelFunc         // 取消函数
 	stats           *PoolManagerStats          // 管理器统计
+}
+
+// AggregateConnectionStats 汇总所有连接池的连接统计
+type AggregateConnectionStats struct {
+	NumPools          int   `json:"num_pools"`
+	TotalConnections  int64 `json:"total_connections"`
+	ActiveConnections int64 `json:"active_connections"`
+	IdleConnections   int64 `json:"idle_connections"`
+	MaxPerPool        int   `json:"max_per_pool"`
+	TotalCapacity     int   `json:"total_capacity"`
 }
 
 // PoolManagerStats 池管理器统计
@@ -660,7 +737,41 @@ func (pm *PoolManager) GetStats() PoolManagerStats {
 	}
 }
 
+// GetAggregateConnectionStats 统计所有池的总览
+func (pm *PoolManager) GetAggregateConnectionStats() AggregateConnectionStats {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	var agg AggregateConnectionStats
+	agg.NumPools = len(pm.pools)
+	agg.MaxPerPool = pm.maxSize
+	agg.TotalCapacity = pm.maxSize * len(pm.pools)
+
+	for _, pool := range pm.pools {
+		s := pool.GetStats()
+		agg.TotalConnections += s.TotalConnections
+		agg.ActiveConnections += s.ActiveConnections
+		agg.IdleConnections += s.IdleConnections
+	}
+	return agg
+}
+
 // GetClassifier 获取命令分类器
 func (pm *PoolManager) GetClassifier() *CommandClassifier {
 	return pm.classifier
+}
+
+// GetHelloResponse 从管理器按协议版本获取HELLO缓存
+func (pm *PoolManager) GetHelloResponse(protoVer int) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	for _, pool := range pm.pools {
+		if pool.context != nil && pool.context.ProtocolVersion == protoVer {
+			resp := pool.GetHelloResponse()
+			if resp != "" {
+				return resp
+			}
+		}
+	}
+	return ""
 }

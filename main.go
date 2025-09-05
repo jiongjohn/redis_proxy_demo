@@ -17,7 +17,7 @@ func main() {
 	fmt.Println("🚀 Redis Proxy Demo - Starting...")
 
 	// Parse command line arguments
-	var configFile = flag.String("c", "etc/config-goredis-v2-fixed.yaml", "Configuration file path")
+	var configFile = flag.String("c", "etc/config-affinity.yaml", "Configuration file path")
 	flag.Parse()
 
 	// Load configuration
@@ -82,8 +82,6 @@ func main() {
 	} else if c.Server.UseAffinity {
 		serverType = "Connection Affinity"
 		connectionMode = "1:1 Connection Mapping"
-	} else if c.Server.UseGnet {
-		serverType = "High-Performance (gnet)"
 	}
 
 	fmt.Printf("\n🚀 Starting %s Redis Proxy Server...\n", serverType)
@@ -114,12 +112,6 @@ func main() {
 		fmt.Printf("├── Idle Timeout: %s\n", proxyConfig.MaxIdleTime)
 		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
 		fmt.Printf("└── Transaction Commands: ✅ MULTI/EXEC Supported\n")
-	} else {
-		// Show pool-specific configuration
-		fmt.Printf("├── Max Idle Time: %s\n", proxyConfig.MaxIdleTime)
-		fmt.Printf("├── Pool Max Idle: %d\n", proxyConfig.PoolMaxIdle)
-		fmt.Printf("├── Pool Max Active: %d\n", proxyConfig.PoolMaxActive)
-		fmt.Printf("└── Pool Conn Timeout: %s\n", proxyConfig.PoolConnTimeout)
 	}
 
 	// Create appropriate server based on configuration
@@ -177,27 +169,6 @@ func main() {
 		if err := server.ListenAndServe(); err != nil {
 			log.Fatalf("Failed to start affinity proxy server: %v", err)
 		}
-	} else if c.Server.UseGnet {
-		// Use gnet high-performance server
-		server, err := proxy.NewGNetServer(proxyConfig)
-		if err != nil {
-			log.Fatalf("Failed to create gnet proxy server: %v", err)
-		}
-
-		logx.Info("High-performance Redis Proxy with gnet starting...")
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Failed to start gnet proxy server: %v", err)
-		}
-	} else {
-		// Use traditional server
-		server, err := proxy.NewServer(proxyConfig)
-		if err != nil {
-			log.Fatalf("Failed to create traditional proxy server: %v", err)
-		}
-
-		logx.Info("Traditional Redis Proxy with Connection Pool starting...")
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Failed to start traditional proxy server: %v", err)
-		}
 	}
+	return
 }
