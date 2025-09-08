@@ -73,7 +73,10 @@ func main() {
 	serverType := "Traditional"
 	connectionMode := "Connection Pool"
 
-	if c.Server.UseIntelligentPool {
+	if c.Server.UseDedicatedProxy {
+		serverType = "Dedicated Connection Pool Proxy"
+		connectionMode = "1:1 Client-Redis Binding with Pool Management"
+	} else if c.Server.UseIntelligentPool {
 		serverType = "Intelligent Connection Pool Proxy"
 		connectionMode = "NORMAL/INIT/SESSION Command Classification"
 	} else if c.Server.UseAffinity {
@@ -93,7 +96,21 @@ func main() {
 		return "Disabled"
 	}())
 
-	if c.Server.UseIntelligentPool {
+	if c.Server.UseDedicatedProxy {
+		// Show dedicated proxy specific configuration
+		fmt.Printf("├── Max Connections: %d\n", c.DedicatedProxy.MaxConnections)
+		fmt.Printf("├── Init Connections: %d\n", c.DedicatedProxy.InitConnections)
+		fmt.Printf("├── Wait Timeout: %s\n", c.DedicatedProxy.WaitTimeout)
+		fmt.Printf("├── Idle Timeout: %s\n", c.DedicatedProxy.IdleTimeout)
+		fmt.Printf("├── Session Timeout: %s\n", c.DedicatedProxy.SessionTimeout)
+		fmt.Printf("├── Command Timeout: %s\n", c.DedicatedProxy.CommandTimeout)
+		fmt.Printf("├── Default Database: %d\n", c.DedicatedProxy.DefaultDatabase)
+		fmt.Printf("├── Client-Redis Binding: ✅ 1:1 Dedicated Connection\n")
+		fmt.Printf("├── Connection Pool Management: ✅ Pre-allocated + Dynamic\n")
+		fmt.Printf("├── Redis Protocol Support: ✅ RESP2/RESP3 + Full Commands\n")
+		fmt.Printf("├── Session Isolation: ✅ Complete Client Isolation\n")
+		fmt.Printf("└── Resource Control: ✅ Strict Connection Limits\n")
+	} else if c.Server.UseIntelligentPool {
 		// Show intelligent pool specific configuration
 		fmt.Printf("├── Max Pool Size: %d\n", c.IntelligentPool.MaxPoolSize)
 		fmt.Printf("├── Min Idle Connections: %d\n", c.IntelligentPool.MinIdleConns)
@@ -123,7 +140,51 @@ func main() {
 
 	fmt.Printf("\n🚀 Starting Redis Proxy Server...path:%s,config :%+v \n", *configFile, c.IntelligentPool)
 	// Create appropriate server based on configuration
-	if c.Server.UseIntelligentPool {
+	if c.Server.UseDedicatedProxy {
+		// Parse DedicatedProxy configuration durations
+		waitTimeout, _ := time.ParseDuration(c.DedicatedProxy.WaitTimeout)
+		idleTimeout, _ := time.ParseDuration(c.DedicatedProxy.IdleTimeout)
+		sessionTimeout, _ := time.ParseDuration(c.DedicatedProxy.SessionTimeout)
+		commandTimeout, _ := time.ParseDuration(c.DedicatedProxy.CommandTimeout)
+
+		// Create dedicated proxy server configuration
+		dedicatedConfig := proxy.DedicatedServerConfig{
+			ListenAddr:        fmt.Sprintf(":%d", c.Server.Port),
+			RedisAddr:         fmt.Sprintf("%s:%d", c.Redis.Host, c.Redis.Port),
+			RedisPassword:     c.Redis.Password,
+			MaxConnections:    c.DedicatedProxy.MaxConnections,
+			InitConnections:   c.DedicatedProxy.InitConnections,
+			WaitTimeout:       waitTimeout,
+			IdleTimeout:       idleTimeout,
+			SessionTimeout:    sessionTimeout,
+			CommandTimeout:    commandTimeout,
+			DefaultDatabase:   c.DedicatedProxy.DefaultDatabase,
+			DefaultClientName: c.DedicatedProxy.DefaultClientName,
+		}
+
+		// Create dedicated proxy server
+		server, err := proxy.NewDedicatedServer(dedicatedConfig)
+		if err != nil {
+			log.Fatalf("Failed to create dedicated proxy server: %v", err)
+		}
+
+		logx.Info("🚀 专用连接池Redis代理启动中...")
+		logx.Info("✅ 1:1客户端-Redis连接绑定")
+		logx.Info("✅ 完整的Redis协议支持 (RESP2/RESP3)")
+		logx.Info("✅ 智能连接池管理 (预分配+动态扩展)")
+		logx.Info("✅ 严格的资源控制和会话隔离")
+		logx.Info(fmt.Sprintf("🏊 最大连接数: %d", c.DedicatedProxy.MaxConnections))
+		logx.Info(fmt.Sprintf("🔥 初始连接数: %d", c.DedicatedProxy.InitConnections))
+		logx.Info(fmt.Sprintf("⏱️ 等待超时: %v", waitTimeout))
+		logx.Info(fmt.Sprintf("💤 空闲超时: %v", idleTimeout))
+
+		if err := server.Start(); err != nil {
+			log.Fatalf("Failed to start dedicated proxy server: %v", err)
+		}
+
+		// Keep the server running
+		select {}
+	} else if c.Server.UseIntelligentPool {
 		// Parse IntelligentPool configuration durations
 		idleTimeout, _ := time.ParseDuration(c.IntelligentPool.IdleTimeout)
 		maxLifetime, _ := time.ParseDuration(c.IntelligentPool.MaxLifetime)

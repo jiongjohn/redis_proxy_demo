@@ -1,0 +1,67 @@
+# 专用连接池Redis代理配置文件
+server:
+  port: 6380
+  max_connections: 1000
+  read_timeout: "30s"
+  write_timeout: "30s" 
+  idle_timeout: "300s"
+  use_gnet: false
+  use_affinity: false
+  use_goredis: false
+  use_goredis_v2: false
+  use_goredis_v2_fixed: false
+  use_intelligent_pool: false
+  use_optimized_affinity: false
+  use_dedicated_proxy: true  # 启用专用连接池代理
+
+# 专用连接池配置
+dedicated_proxy:
+  max_connections: 100      # 最大Redis连接数
+  init_connections: 10      # 初始连接数
+  wait_timeout: "5s"        # 获取连接等待超时
+  idle_timeout: "30s"        # 连接空闲超时
+  session_timeout: "10m"    # 客户端会话超时
+  command_timeout: "30s"    # Redis命令执行超时
+  default_database: 0       # 默认数据库
+  default_client_name: "redis-proxy-dedicated"  # 默认客户端名称
+  stats_interval: "30s"     # 统计报告间隔
+
+# Redis服务器配置
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""              # Redis密码（如果有）
+  database: 0
+  pool_size: 10
+  min_idle_connections: 2
+  max_idle_connections: 5
+  connection_timeout: "5s"
+  read_timeout: "3s"
+  write_timeout: "3s"
+
+# 缓存配置（可选）
+cache:
+  enabled: false
+  max_size: "256MB"
+  ttl: "300s"
+  eviction_policy: "lru"
+  cleanup_interval: "60s"
+
+# Kafka配置（可选）
+kafka:
+  enabled: false
+  brokers: ["localhost:9092"]
+  topic: "redis-cache-events"
+  group_id: "redis-proxy-group"
+  auto_offset_reset: "latest"
+  session_timeout: "30s"
+  heartbeat_interval: "3s"
+
+# 监控配置
+monitoring:
+  enabled: true
+  big_key_threshold: "10MB"
+  stats_interval: "60s"
+  metrics_port: 8080
+  health_check_path: "/health"
+  metrics_path: "/metrics"

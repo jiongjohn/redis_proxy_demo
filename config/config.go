@@ -15,6 +15,7 @@ type Config struct {
 		UseGoRedisV2Fixed    bool   `json:"use_goredis_v2_fixed,default=false"`   // Use go-redis V2 Fixed (direct RESP responses)
 		UseIntelligentPool   bool   `json:"use_intelligent_pool,default=false"`   // Use intelligent connection pooling based on command classification
 		UseOptimizedAffinity bool   `json:"use_optimized_affinity,default=false"` // Use optimized connection affinity with pre-connection pool
+		UseDedicatedProxy    bool   `json:"use_dedicated_proxy,default=false"`    // Use dedicated connection pool proxy with 1:1 client-redis binding
 	} `json:"server"`
 
 	// ConnectionAffinity configuration for connection affinity mode
@@ -56,6 +57,19 @@ type Config struct {
 		MaxRetries         int    `json:"max_retries,default=3"`
 		ConnectionHoldTime string `json:"connection_hold_time,default=30s"`
 	} `json:"intelligent_pool"`
+
+	// DedicatedProxy configuration for dedicated connection pool mode
+	DedicatedProxy struct {
+		MaxConnections    int    `json:"max_connections,default=100"`                       // Maximum Redis connections in pool
+		InitConnections   int    `json:"init_connections,default=10"`                       // Initial connections to create
+		WaitTimeout       string `json:"wait_timeout,default=5s"`                           // Timeout when waiting for available connection
+		IdleTimeout       string `json:"idle_timeout,default=5m"`                           // Connection idle timeout
+		SessionTimeout    string `json:"session_timeout,default=10m"`                       // Client session timeout
+		CommandTimeout    string `json:"command_timeout,default=30s"`                       // Redis command execution timeout
+		DefaultDatabase   int    `json:"default_database,default=0"`                        // Default Redis database
+		DefaultClientName string `json:"default_client_name,default=redis-proxy-dedicated"` // Default client name
+		StatsInterval     string `json:"stats_interval,default=30s"`                        // Statistics reporting interval
+	} `json:"dedicated_proxy"`
 
 	Redis struct {
 		Host               string `json:"host,default=localhost"`

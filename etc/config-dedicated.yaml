@@ -1,0 +1,50 @@
+# 专用连接池Redis代理配置
+server:
+  # 监听端口
+  port: 6380
+  
+  # 启用专用代理模式
+  use_dedicated_proxy: true
+  
+redis:
+  # Redis服务器地址
+  host: "127.0.0.1"
+  port: 6379
+  
+  # Redis密码（如果有）
+  password: ""
+
+# 专用代理配置
+dedicated_proxy:
+  # 最大连接数
+  max_connections: 100
+  
+  # 初始连接数
+  init_connections: 10
+  
+  # 获取连接等待超时
+  wait_timeout: "5s"
+  
+  # 连接空闲超时（超过此时间的空闲连接将被关闭）
+  idle_timeout: "300s"  # 5分钟
+  
+  # 会话超时（客户端无活动时间）
+  session_timeout: "600s"  # 10分钟
+  
+  # 命令执行超时
+  command_timeout: "30s"
+  
+  # 默认数据库
+  default_database: 0
+  
+  # 默认客户端名称
+  default_client_name: "redis-proxy-dedicated"
+
+# 日志配置
+logging:
+  level: "info"  # debug, info, warn, error
+  
+# 监控配置
+monitoring:
+  # 统计报告间隔
+  stats_interval: "30s"
