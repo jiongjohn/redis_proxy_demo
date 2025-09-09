@@ -302,9 +302,9 @@ func (h *DedicatedHandler) ForwardOneRESPResponseWithProto(redisConn net.Conn, c
 	protoReader := proto.NewReaderSize(streamForwarder, 64*1024)
 
 	// // 解析一个完整的RESP响应，数据在解析过程中直接转发
-	//_, err := protoReader.ReadReply()
+	_, err := protoReader.ReadReply()
 	// 只判断边界，不解析数据内容, 数据在解析过程中直接转发
-	err := protoReader.DiscardNext()
+	//err := protoReader.DiscardNext()
 	if err != nil {
 		return fmt.Errorf("流式跳过RESP响应失败: %w", err)
 	}
