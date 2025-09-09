@@ -38,9 +38,6 @@ type DedicatedHandler struct {
 	cancel         context.CancelFunc
 	mu             sync.RWMutex
 	stats          *DedicatedHandlerStats
-	// 预生成的响应缓存
-	helloV2 string
-	helloV3 string
 }
 
 // DedicatedHandlerConfig 专用处理器配置
@@ -97,40 +94,10 @@ func NewDedicatedHandler(config DedicatedHandlerConfig) (*DedicatedHandler, erro
 		ctx:            ctx,
 		cancel:         cancel,
 		stats:          &DedicatedHandlerStats{},
-		helloV2:        "+OK\r\n",
-		helloV3:        "",
 	}
 
-	// 尝试获取缓存的HELLO 3响应
-	// 通过创建一个RESP3上下文来触发HELLO命令的执行和缓存
-	resp3Context := &ConnectionContext{
-		Database:        config.DefaultDatabase,
-		Username:        "",
-		Password:        "",
-		ClientName:      config.DefaultClientName,
-		ProtocolVersion: 3,
-		TrackingEnabled: false,
-		TrackingOptions: "",
-	}
-
-	// 获取一个连接来触发HELLO 3命令的执行
-	testConn, err := pool.GetConnection("hello_test", resp3Context)
-	if err == nil {
-		// 立即释放连接
-		pool.ReleaseConnection(testConn)
-		// 获取缓存的HELLO响应
-		handler.helloV3 = pool.GetHelloV3Response()
-		if handler.helloV3 != "" {
-			logger.Debug(fmt.Sprintf("✅ 获取到HELLO 3响应缓存: %d 字节", len(handler.helloV3)))
-		} else {
-			logger.Warn("⚠️ HELLO 3响应缓存为空")
-		}
-	} else {
-		logger.Warn(fmt.Sprintf("❌ 无法获取HELLO 3响应缓存: %v", err))
-	}
-
-	// 启动会话清理协程
-	go handler.sessionCleanupLoop()
+	// 启动会话清理协程（暂时不需要清理， ）
+	//go handler.sessionCleanupLoop()
 	go handler.statsReporter()
 
 	return handler, nil
@@ -281,11 +248,6 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 
 	logger.Debug(fmt.Sprintf("📝 会话 %s 执行命令: %s %v", session.ID, commandName, args[1:]))
 
-	// 处理初始化命令
-	if h.isInitCommand(commandName) {
-		return h.handleInitCommand(session, args)
-	}
-
 	// 确保有Redis连接（优化：减少不必要的连接获取）
 	if session.RedisConn == nil {
 		conn, err := h.pool.GetConnection(session.ID, session.Context)
@@ -377,178 +339,6 @@ func (h *DedicatedHandler) forwardResponseWithProto(session *DedicatedClientSess
 	return h.ForwardOneRESPResponseWithProto(session.RedisConn.conn, session.ClientConn, timeout)
 }
 
-// isInitCommand 判断是否是初始化命令
-func (h *DedicatedHandler) isInitCommand(commandName string) bool {
-	if commandName == "" {
-		// hello 暂时不处理
-		return false
-	}
-	switch commandName {
-	case "SELECT", "AUTH", "HELLO":
-		return true
-	default:
-		return false
-	}
-}
-
-// handleInitCommand 处理初始化命令
-func (h *DedicatedHandler) handleInitCommand(session *DedicatedClientSession, args []string) error {
-	commandName := strings.ToUpper(args[0])
-
-	switch commandName {
-	case "SELECT":
-		return h.handleInitSelect(session, args)
-	case "AUTH":
-		return h.handleInitAuth(session, args)
-	case "HELLO":
-		return h.handleInitHello(session, args)
-	case "CLIENT":
-		return h.handleInitClient(session, args)
-	default:
-		h.sendSimpleString(session.ClientConn, "OK")
-		return nil
-	}
-}
-
-// handleInitSelect 处理 SELECT 命令
-func (h *DedicatedHandler) handleInitSelect(session *DedicatedClientSession, args []string) error {
-	if len(args) != 2 {
-		h.sendError(session.ClientConn, fmt.Errorf("SELECT命令参数错误"))
-		return nil
-	}
-	var dbNum int
-	if _, err := fmt.Sscanf(args[1], "%d", &dbNum); err != nil {
-		h.sendError(session.ClientConn, fmt.Errorf("无效的数据库编号: %s", args[1]))
-		return nil
-	}
-
-	session.mu.Lock()
-	session.Context.Database = dbNum
-	session.mu.Unlock()
-
-	h.resetSessionConnection(session)
-	h.sendSimpleString(session.ClientConn, "OK")
-	return nil
-}
-
-// handleInitAuth 处理 AUTH 命令
-func (h *DedicatedHandler) handleInitAuth(session *DedicatedClientSession, args []string) error {
-	if len(args) == 2 {
-		session.mu.Lock()
-		session.Context.Username = ""
-		session.Context.Password = args[1]
-		session.mu.Unlock()
-	} else if len(args) == 3 {
-		session.mu.Lock()
-		session.Context.Username = args[1]
-		session.Context.Password = args[2]
-		session.mu.Unlock()
-	} else {
-		h.sendError(session.ClientConn, fmt.Errorf("AUTH命令参数错误"))
-		return nil
-	}
-
-	//h.resetSessionConnection(session)
-	h.sendSimpleString(session.ClientConn, "OK")
-	return nil
-}
-
-// handleInitHello 处理 HELLO 命令
-func (h *DedicatedHandler) handleInitHello(session *DedicatedClientSession, args []string) error {
-	needReset := false
-
-	if len(args) > 1 {
-		if args[1] == "3" {
-			session.mu.Lock()
-			oldVersion := session.Context.ProtocolVersion
-			session.Context.ProtocolVersion = 3
-			session.mu.Unlock()
-			if oldVersion != 3 {
-				needReset = true
-			}
-		}
-		// 解析可选项
-		for i := 2; i < len(args); i++ {
-			switch strings.ToUpper(args[i]) {
-			case "AUTH":
-				if i+2 < len(args) {
-					session.mu.Lock()
-					session.Context.Username = args[i+1]
-					session.Context.Password = args[i+2]
-					session.mu.Unlock()
-					needReset = true
-					i += 2
-				}
-			case "SETNAME":
-				if i+1 < len(args) {
-					session.mu.Lock()
-					session.Context.ClientName = args[i+1]
-					session.mu.Unlock()
-					needReset = true
-					i += 1
-				}
-			}
-		}
-	}
-
-	// 只有在真正需要时才重置连接
-	if needReset {
-		h.resetSessionConnection(session)
-	}
-
-	h.sendHelloResponse(session)
-	return nil
-}
-
-// handleInitClient 处理 CLIENT 子命令
-func (h *DedicatedHandler) handleInitClient(session *DedicatedClientSession, args []string) error {
-	if len(args) < 2 {
-		h.sendSimpleString(session.ClientConn, "OK")
-		return nil
-	}
-
-	sub := strings.ToUpper(args[1])
-	needReset := false
-
-	switch sub {
-	case "SETNAME":
-		if len(args) >= 3 {
-			session.mu.Lock()
-			oldName := session.Context.ClientName
-			session.Context.ClientName = args[2]
-			session.mu.Unlock()
-			// 只有在客户端名称真正改变时才重置连接
-			if oldName != args[2] {
-				needReset = true
-			}
-		}
-	case "TRACKING":
-		if len(args) > 2 {
-			flag := strings.ToUpper(args[2])
-			session.mu.Lock()
-			oldEnabled := session.Context.TrackingEnabled
-			session.Context.TrackingEnabled = (flag == "ON")
-			session.Context.TrackingOptions = strings.Join(args[3:], " ")
-			session.mu.Unlock()
-			// 只有在跟踪状态改变时才重置连接
-			if oldEnabled != (flag == "ON") {
-				needReset = true
-			}
-		}
-	case "SETINFO":
-		// SETINFO命令只是设置客户端信息，不需要重置连接
-		// 本地接受并返回OK
-	}
-
-	// 只有在真正需要时才重置连接
-	if needReset {
-		h.resetSessionConnection(session)
-	}
-
-	h.sendSimpleString(session.ClientConn, "OK")
-	return nil
-}
-
 // forwardCommandRaw 转发原始命令数据到Redis
 func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, rawData []byte) error {
 	if session.RedisConn == nil {
@@ -565,50 +355,6 @@ func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, ra
 
 	// 使用proto库的流式转发
 	return h.forwardResponseWithProto(session)
-}
-
-// forwardResponse 零拷贝高性能转发Redis响应到客户端
-func (h *DedicatedHandler) forwardResponse(session *DedicatedClientSession) error {
-	// 使用io.Copy进行零拷贝转发，但需要处理超时
-	session.RedisConn.conn.SetReadDeadline(time.Now().Add(h.config.CommandTimeout))
-	defer session.RedisConn.conn.SetDeadline(time.Time{})
-
-	// 使用更大的缓冲区，一次性读写
-	buffer := make([]byte, 65536) // 64KB缓冲区，减少系统调用
-	totalBytes := 0
-
-	for {
-		// 设置较短的读超时来快速检测响应结束
-		if totalBytes > 0 {
-			session.RedisConn.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
-		}
-
-		n, err := session.RedisConn.conn.Read(buffer)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				if totalBytes > 0 {
-					break // 已读取数据，超时表示结束
-				}
-				return fmt.Errorf("读取Redis响应超时")
-			}
-			if err == io.EOF && totalBytes > 0 {
-				break
-			}
-			return fmt.Errorf("读取Redis响应失败: %w", err)
-		}
-
-		if n > 0 {
-			totalBytes += n
-			// 直接写入，避免额外拷贝
-			if _, err = session.ClientConn.Write(buffer[:n]); err != nil {
-				return fmt.Errorf("发送响应失败: %w", err)
-			}
-		} else {
-			break
-		}
-	}
-
-	return nil
 }
 
 // parseCommandWithRaw 解析客户端命令并保存原始数据
@@ -718,43 +464,6 @@ func (h *DedicatedHandler) sendSimpleString(conn net.Conn, s string) {
 	conn.Write([]byte(response))
 }
 
-// sendHelloResponse 发送HELLO响应
-func (h *DedicatedHandler) sendHelloResponse(session *DedicatedClientSession) {
-	session.mu.RLock()
-	pv := session.Context.ProtocolVersion
-	session.mu.RUnlock()
-
-	if pv == 3 {
-		// 优先使用缓存的真实HELLO响应
-		if h.helloV3 != "" {
-			logger.Debug(fmt.Sprintf("发送缓存的HELLO 3响应: %d 字节, 内容: %q", len(h.helloV3), h.helloV3))
-			session.ClientConn.Write([]byte(h.helloV3))
-			return // 真实的HELLO响应是完整的，不需要额外的OK
-		}
-
-		// 如果没有缓存，尝试从连接池获取
-		if cachedResp := h.pool.GetHelloV3Response(); cachedResp != "" {
-			h.helloV3 = cachedResp
-			session.ClientConn.Write([]byte(h.helloV3))
-			return // 真实的HELLO响应是完整的，不需要额外的OK
-		}
-
-		// 如果都没有，使用模拟的响应作为后备
-		resp := "%7\r\n"                              // Map with 7 key-value pairs
-		resp += "$6\r\nserver\r\n$5\r\nredis\r\n"     // "server" => "redis"
-		resp += "$7\r\nversion\r\n$5\r\n7.0.0\r\n"    // "version" => "7.0.0"
-		resp += "$5\r\nproto\r\n:3\r\n"               // "proto" => 3
-		resp += "$2\r\nid\r\n:1\r\n"                  // "id" => 1
-		resp += "$4\r\nmode\r\n$10\r\nstandalone\r\n" // "mode" => "standalone"
-		resp += "$4\r\nrole\r\n$6\r\nmaster\r\n"      // "role" => "master"
-		resp += "$7\r\nmodules\r\n*0\r\n"             // "modules" => []
-
-		session.ClientConn.Write([]byte(resp))
-	}
-	// 对于RESP2或模拟的RESP3响应，发送OK
-	h.sendSimpleString(session.ClientConn, "OK")
-}
-
 // isConnectionClosed 检查是否是连接关闭错误
 func (h *DedicatedHandler) isConnectionClosed(err error) bool {
 	if err == nil {
@@ -770,7 +479,21 @@ func (h *DedicatedHandler) isConnectionClosed(err error) bool {
 
 // shouldDisconnectOnError 判断错误是否需要断开连接
 func (h *DedicatedHandler) shouldDisconnectOnError(err error) bool {
-	return h.isConnectionClosed(err)
+	if h.isConnectionClosed(err) {
+		return true
+	}
+
+	// 连接池相关错误也需要断开客户端连接
+	errStr := err.Error()
+	if strings.Contains(errStr, "获取Redis连接失败") ||
+		strings.Contains(errStr, "连接池已满") ||
+		strings.Contains(errStr, "等待连接超时") ||
+		strings.Contains(errStr, "连接超时") {
+		logger.Warn(fmt.Sprintf("连接池错误，断开客户端: %v", err))
+		return true
+	}
+
+	return false
 }
 
 // sessionCleanupLoop 会话清理循环

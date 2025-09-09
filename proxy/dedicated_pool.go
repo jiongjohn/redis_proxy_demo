@@ -92,8 +92,7 @@ func NewDedicatedConnectionPool(config DedicatedPoolConfig) (*DedicatedConnectio
 		pool.availableQueue <- conn
 	}
 
-	pool.stats.TotalConnections = int64(config.InitSize)
-	pool.stats.IdleConnections = int64(config.InitSize)
+	// 只设置创建计数，其他统计基于实际数据计算
 	pool.stats.ConnectionsCreated = int64(config.InitSize)
 
 	// 启动清理协程
@@ -103,7 +102,7 @@ func NewDedicatedConnectionPool(config DedicatedPoolConfig) (*DedicatedConnectio
 	return pool, nil
 }
 
-// GetConnection 获取连接
+// GetConnection 获取连接 - 优化版本，减少锁竞争
 func (p *DedicatedConnectionPool) GetConnection(clientID string, connCtx *ConnectionContext) (*DedicatedConnection, error) {
 	if atomic.LoadInt32(&p.closed) != 0 {
 		return nil, fmt.Errorf("连接池已关闭")
@@ -116,7 +115,7 @@ func (p *DedicatedConnectionPool) GetConnection(clientID string, connCtx *Connec
 	totalConns := len(p.connections)
 	logger.Debug(fmt.Sprintf("获取连接请求: 客户端=%s, 队列长度=%d, 总连接数=%d", clientID, queueLen, totalConns))
 
-	// 尝试从可用队列获取连接
+	// 快速路径：尝试从可用队列获取连接（非阻塞）
 	select {
 	case conn := <-p.availableQueue:
 		// 检查连接是否有效
@@ -126,56 +125,63 @@ func (p *DedicatedConnectionPool) GetConnection(clientID string, connCtx *Connec
 				// 连接初始化失败，关闭连接并重试
 				logger.Debug(fmt.Sprintf("连接绑定失败，重试: %v", err))
 				p.closeConnection(conn)
-				return p.createAndBindConnection(clientID, connCtx)
+				// 快速失败，不递归重试
+				atomic.AddInt64(&p.stats.GetTimeouts, 1)
+				return nil, fmt.Errorf("连接绑定失败: %w", err)
 			}
 			atomic.AddInt64(&p.stats.GetSuccesses, 1)
 			logger.Debug(fmt.Sprintf("成功获取现有连接: %s -> %s", clientID, conn.id))
 			return conn, nil
 		} else {
-			// 连接无效，关闭并创建新连接
-			logger.Debug(fmt.Sprintf("连接无效，关闭并创建新连接: %s", conn.id))
+			// 连接无效，关闭连接
+			logger.Debug(fmt.Sprintf("连接无效，关闭连接: %s", conn.id))
 			p.closeConnection(conn)
-			// 直接创建新连接，不再递归调用createAndBindConnection避免无限循环
-			return p.createNewConnection(clientID, connCtx)
 		}
 	default:
-		// 没有可用连接，尝试创建新连接
-		logger.Debug(fmt.Sprintf("队列为空，创建新连接: %s", clientID))
-		return p.createAndBindConnection(clientID, connCtx)
+		// 队列为空，继续到慢速路径
 	}
+
+	// 慢速路径：尝试创建新连接或等待
+	return p.getConnectionSlowPath(clientID, connCtx)
 }
 
-// createAndBindConnection 创建并绑定连接
-func (p *DedicatedConnectionPool) createAndBindConnection(clientID string, connCtx *ConnectionContext) (*DedicatedConnection, error) {
-	p.mu.Lock()
-
-	// 检查是否超过最大连接数
+// getConnectionSlowPath 慢速路径：创建新连接或等待可用连接
+func (p *DedicatedConnectionPool) getConnectionSlowPath(clientID string, connCtx *ConnectionContext) (*DedicatedConnection, error) {
+	// 检查是否可以创建新连接（无锁检查）
 	currentSize := len(p.connections)
-	if currentSize >= p.maxSize {
-		logger.Debug(fmt.Sprintf("连接池已满 (%d/%d)，等待可用连接: %s", currentSize, p.maxSize, clientID))
-		p.mu.Unlock() // 释放锁后等待可用连接
-		// 等待可用连接
+	if currentSize < p.maxSize {
+		// 尝试创建新连接
+		conn, err := p.tryCreateConnection(clientID, connCtx)
+		if err == nil {
+			return conn, nil
+		}
+		// 创建失败，继续到等待逻辑
+		logger.Debug(fmt.Sprintf("创建连接失败: %v", err))
+	}
+
+	// 连接池已满或创建失败，等待可用连接
+	logger.Debug(fmt.Sprintf("连接池已满或创建失败，等待可用连接: %s", clientID))
+
+	timeout := time.NewTimer(p.waitTimeout)
+	defer timeout.Stop()
+
+	for {
 		select {
 		case conn := <-p.availableQueue:
-			// 重新获取锁来操作连接
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			logger.Debug(fmt.Sprintf("从等待队列获取连接: %s -> %s", clientID, conn.id))
 			if p.isConnectionValid(conn) {
 				err := p.bindConnection(conn, clientID, connCtx)
 				if err != nil {
 					p.closeConnection(conn)
-					atomic.AddInt64(&p.stats.GetTimeouts, 1)
-					return nil, fmt.Errorf("连接初始化失败: %w", err)
+					continue // 继续等待下一个连接
 				}
 				atomic.AddInt64(&p.stats.GetSuccesses, 1)
+				logger.Debug(fmt.Sprintf("等待获取连接成功: %s -> %s", clientID, conn.id))
 				return conn, nil
 			} else {
 				p.closeConnection(conn)
-				atomic.AddInt64(&p.stats.GetTimeouts, 1)
-				return nil, fmt.Errorf("获取到无效连接")
+				continue // 继续等待下一个连接
 			}
-		case <-time.After(p.waitTimeout):
+		case <-timeout.C:
 			atomic.AddInt64(&p.stats.GetTimeouts, 1)
 			logger.Debug(fmt.Sprintf("等待连接超时: %s (超时时间: %v)", clientID, p.waitTimeout))
 			return nil, fmt.Errorf("获取连接超时")
@@ -183,10 +189,17 @@ func (p *DedicatedConnectionPool) createAndBindConnection(clientID string, connC
 			return nil, fmt.Errorf("连接池已关闭")
 		}
 	}
+}
 
-	// 如果没有超过最大连接数，继续创建新连接（此时仍持有锁）
-	logger.Debug(fmt.Sprintf("创建新连接: %s (当前池大小: %d/%d)", clientID, currentSize, p.maxSize))
+// tryCreateConnection 尝试创建新连接（带锁保护）
+func (p *DedicatedConnectionPool) tryCreateConnection(clientID string, connCtx *ConnectionContext) (*DedicatedConnection, error) {
+	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// 再次检查连接数（双重检查）
+	if len(p.connections) >= p.maxSize {
+		return nil, fmt.Errorf("连接池已满")
+	}
 
 	// 创建新连接
 	conn, err := p.createConnection()
@@ -195,23 +208,16 @@ func (p *DedicatedConnectionPool) createAndBindConnection(clientID string, connC
 	}
 
 	p.connections = append(p.connections, conn)
-	atomic.AddInt64(&p.stats.TotalConnections, 1)
-	atomic.AddInt64(&p.stats.ConnectionsCreated, 1)
-	atomic.AddInt64(&p.stats.ActiveConnections, 1) // 新连接直接标记为活跃
+	atomic.AddInt64(&p.stats.ConnectionsCreated, 1) // 只更新创建计数
 
-	err = p.bindConnectionWithStats(conn, clientID, connCtx, false) // 不更新统计，因为已经手动更新了
+	// 绑定连接
+	err = p.bindConnection(conn, clientID, connCtx)
 	if err != nil {
-		// 绑定失败，需要清理统计和连接
-		p.connections = p.connections[:len(p.connections)-1]
-		atomic.AddInt64(&p.stats.TotalConnections, -1)
-		atomic.AddInt64(&p.stats.ActiveConnections, -1)
-		conn.conn.Close()
-		return nil, fmt.Errorf("绑定连接失败: %w", err)
+		p.closeConnection(conn)
+		return nil, fmt.Errorf("连接绑定失败: %w", err)
 	}
 
-	atomic.AddInt64(&p.stats.GetSuccesses, 1)
-
-	logger.Debug(fmt.Sprintf("创建新连接: %s -> %s (池大小: %d/%d)", clientID, conn.id, len(p.connections), p.maxSize))
+	logger.Debug(fmt.Sprintf("成功创建新连接: %s -> %s", clientID, conn.id))
 	return conn, nil
 }
 
@@ -250,164 +256,15 @@ func (p *DedicatedConnectionPool) bindConnectionWithStats(conn *DedicatedConnect
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
-	// 检查连接之前的状态
-	wasInUse := atomic.LoadInt32(&conn.inUse) == 1
-
+	// 设置连接为使用中
 	atomic.StoreInt32(&conn.inUse, 1)
 	atomic.StoreInt64(&conn.lastUsed, time.Now().UnixNano())
 	conn.boundClient = clientID
 
-	// 先应用连接上下文（认证、选择数据库等），然后再设置context
-	err := p.applyConnectionContext(conn, connCtx)
-	if err != nil {
-		return err
-	}
-
 	// 应用成功后才设置context
 	conn.context = connCtx
 
-	// 更新统计：连接变为活跃状态
-	if updateStats && !wasInUse {
-		atomic.AddInt64(&p.stats.ActiveConnections, 1)
-		atomic.AddInt64(&p.stats.IdleConnections, -1)
-	}
-
 	logger.Debug(fmt.Sprintf("绑定连接: %s -> %s", clientID, conn.id))
-	return nil
-}
-
-// applyConnectionContext 应用连接上下文
-func (p *DedicatedConnectionPool) applyConnectionContext(conn *DedicatedConnection, connCtx *ConnectionContext) error {
-	if connCtx == nil {
-		return nil
-	}
-
-	// 执行Redis认证
-	if connCtx.Username != "" || connCtx.Password != "" || p.redisPassword != "" {
-		var authCmd string
-		if connCtx.Username != "" {
-			// AUTH <username> <password>
-			pwd := connCtx.Password
-			authCmd = fmt.Sprintf("*3\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-				len(connCtx.Username), connCtx.Username,
-				len(pwd), pwd)
-		} else {
-			// 单参数AUTH
-			pwd := connCtx.Password
-			if pwd == "" {
-				pwd = p.redisPassword
-			}
-			authCmd = fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(pwd), pwd)
-		}
-
-		err := p.executeCommand(conn.conn, authCmd)
-		if err != nil {
-			return fmt.Errorf("认证失败: %w", err)
-		}
-	}
-
-	// 如果要求RESP3，发送 HELLO 3
-	// 只有在协议版本改变或者连接是新创建的时候才发送HELLO命令
-	needHello := false
-	if connCtx.ProtocolVersion == 3 {
-		if conn.context == nil || conn.context.ProtocolVersion != 3 {
-			needHello = true
-		}
-	}
-
-	logger.Debug(fmt.Sprintf("应用上下文: 协议版本=%d, 需要HELLO=%v, 连接上下文=%v, 连接上下文详情=%+v",
-		connCtx.ProtocolVersion, needHello, conn.context != nil, conn.context))
-
-	if needHello {
-		helloCmd := "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"
-		logger.Debug("发送HELLO 3命令到Redis服务器")
-		err := p.executeCommandAndCacheHello(conn.conn, helloCmd)
-		if err != nil {
-			return fmt.Errorf("HELLO 3失败: %w", err)
-		}
-		logger.Debug(fmt.Sprintf("HELLO 3命令执行成功，缓存长度: %d", len(p.helloV3Cache)))
-	}
-
-	// 设置数据库
-	if connCtx.Database != 0 {
-		selectCmd := fmt.Sprintf("*2\r\n$6\r\nSELECT\r\n$%d\r\n%d\r\n",
-			len(fmt.Sprintf("%d", connCtx.Database)), connCtx.Database)
-		err := p.executeCommand(conn.conn, selectCmd)
-		if err != nil {
-			return fmt.Errorf("选择数据库失败: %w", err)
-		}
-	}
-
-	// 设置客户端名称
-	if connCtx.ClientName != "" {
-		nameCmd := fmt.Sprintf("*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$%d\r\n%s\r\n",
-			len(connCtx.ClientName), connCtx.ClientName)
-		err := p.executeCommand(conn.conn, nameCmd)
-		if err != nil {
-			return fmt.Errorf("设置客户端名称失败: %w", err)
-		}
-	}
-
-	// 设置客户端跟踪
-	if connCtx.TrackingEnabled {
-		trackingCmd := "*3\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n"
-		err := p.executeCommand(conn.conn, trackingCmd)
-		if err != nil {
-			return fmt.Errorf("设置客户端跟踪失败: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// executeCommand 执行Redis命令
-func (p *DedicatedConnectionPool) executeCommand(conn net.Conn, cmd string) error {
-	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err := conn.Write([]byte(cmd))
-	if err != nil {
-		return err
-	}
-
-	// 读取响应
-	buffer := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := conn.Read(buffer)
-	if err != nil {
-		return err
-	}
-
-	response := string(buffer[:n])
-	if !containsOK(response) && response[0] != '%' { // RESP3 map响应以%开头
-		return fmt.Errorf("命令执行失败: %s", response)
-	}
-
-	// 清除deadline
-	conn.SetDeadline(time.Time{})
-	return nil
-}
-
-// executeCommandAndCacheHello 执行HELLO命令并缓存响应
-func (p *DedicatedConnectionPool) executeCommandAndCacheHello(conn net.Conn, cmd string) error {
-	helloCmd := "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n"
-	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err := conn.Write([]byte(helloCmd))
-	if err != nil {
-		return fmt.Errorf("发送HELLO 3命令失败: %w", err)
-	}
-	buffer := make([]byte, 4096)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, err := conn.Read(buffer)
-	if err != nil {
-		return fmt.Errorf("读取HELLO 3响应失败: %w", err)
-	}
-	// 注意：调用方在创建连接时已持有 pool.mu，这里直接写入避免死锁
-
-	p.mu.Lock()
-	p.helloV3Cache = string(buffer[:n])
-	p.mu.Unlock()
-
-	// 清除deadline
-	conn.SetDeadline(time.Time{})
 	return nil
 }
 
@@ -432,9 +289,7 @@ func (p *DedicatedConnectionPool) ReleaseConnection(conn *DedicatedConnection) {
 	// 将连接放回可用队列 - 修复：阻塞等待而不是直接关闭
 	select {
 	case p.availableQueue <- conn:
-		// 成功放回队列，更新统计
-		atomic.AddInt64(&p.stats.ActiveConnections, -1)
-		atomic.AddInt64(&p.stats.IdleConnections, 1)
+		// 成功放回队列，统计基于实际数据计算
 		logger.Debug(fmt.Sprintf("释放连接: %s", conn.id))
 	case <-time.After(5 * time.Second):
 		// 超时后关闭连接（这种情况应该很少发生）
@@ -562,58 +417,10 @@ func (p *DedicatedConnectionPool) closeConnectionUnsafe(conn *DedicatedConnectio
 
 	conn.conn.Close()
 
-	atomic.AddInt64(&p.stats.TotalConnections, -1)
+	// 只更新关闭计数，其他统计基于实际数据计算
 	atomic.AddInt64(&p.stats.ConnectionsClosed, 1)
 
-	if atomic.LoadInt32(&conn.inUse) == 1 {
-		atomic.AddInt64(&p.stats.ActiveConnections, -1)
-	} else {
-		atomic.AddInt64(&p.stats.IdleConnections, -1)
-	}
-
 	logger.Debug(fmt.Sprintf("关闭连接(unsafe): %s", conn.id))
-}
-
-// createNewConnection 直接创建新连接，用于替换无效连接
-func (p *DedicatedConnectionPool) createNewConnection(clientID string, connCtx *ConnectionContext) (*DedicatedConnection, error) {
-	// 直接创建新连接，不检查池大小限制（因为我们是在替换无效连接）
-	logger.Debug(fmt.Sprintf("直接创建新连接替换无效连接: %s", clientID))
-
-	// 连接到Redis
-	conn, err := net.Dial("tcp", p.redisAddr)
-	if err != nil {
-		atomic.AddInt64(&p.stats.GetTimeouts, 1)
-		return nil, fmt.Errorf("连接Redis失败: %w", err)
-	}
-
-	// 创建连接对象
-	id := fmt.Sprintf("dedicated_%d", time.Now().UnixNano())
-	dedicatedConn := &DedicatedConnection{
-		id:       id,
-		conn:     conn,
-		lastUsed: time.Now().UnixNano(),
-		inUse:    1, // 标记为使用中
-	}
-
-	// 添加到连接池（需要获取锁）
-	p.mu.Lock()
-	p.connections = append(p.connections, dedicatedConn)
-	atomic.AddInt64(&p.stats.TotalConnections, 1)
-	atomic.AddInt64(&p.stats.ConnectionsCreated, 1)
-	atomic.AddInt64(&p.stats.ActiveConnections, 1) // 新连接直接标记为活跃
-	p.mu.Unlock()
-
-	// 绑定连接（不持有锁，避免死锁）- 不更新统计，因为已经手动更新了
-	err = p.bindConnectionWithStats(dedicatedConn, clientID, connCtx, false)
-	if err != nil {
-		p.closeConnection(dedicatedConn)
-		atomic.AddInt64(&p.stats.GetTimeouts, 1)
-		return nil, fmt.Errorf("连接初始化失败: %w", err)
-	}
-
-	atomic.AddInt64(&p.stats.GetSuccesses, 1)
-	logger.Debug(fmt.Sprintf("成功创建并绑定新连接: %s -> %s", clientID, id))
-	return dedicatedConn, nil
 }
 
 // closeConnection 关闭连接
@@ -635,14 +442,8 @@ func (p *DedicatedConnectionPool) closeConnection(conn *DedicatedConnection) {
 
 	conn.conn.Close()
 
-	atomic.AddInt64(&p.stats.TotalConnections, -1)
+	// 只更新关闭计数，其他统计基于实际数据计算
 	atomic.AddInt64(&p.stats.ConnectionsClosed, 1)
-
-	if atomic.LoadInt32(&conn.inUse) == 1 {
-		atomic.AddInt64(&p.stats.ActiveConnections, -1)
-	} else {
-		atomic.AddInt64(&p.stats.IdleConnections, -1)
-	}
 
 	logger.Debug(fmt.Sprintf("关闭连接: %s", conn.id))
 }
@@ -699,23 +500,25 @@ func (p *DedicatedConnectionPool) GetStats() DedicatedPoolStats {
 	p.stats.mu.RLock()
 	defer p.stats.mu.RUnlock()
 
+	// 获取实际连接数
+	p.mu.RLock()
+	actualTotal := int64(len(p.connections))
+	availableCount := int64(len(p.availableQueue))
+	p.mu.RUnlock()
+
+	// 计算活跃连接数 = 总连接数 - 可用队列中的连接数
+	actualActive := actualTotal - availableCount
+
 	return DedicatedPoolStats{
-		TotalConnections:   p.stats.TotalConnections,
-		ActiveConnections:  p.stats.ActiveConnections,
-		IdleConnections:    p.stats.IdleConnections,
+		TotalConnections:   actualTotal,    // 使用实际连接数
+		ActiveConnections:  actualActive,   // 计算得出的活跃连接数
+		IdleConnections:    availableCount, // 队列中的空闲连接数
 		ConnectionsCreated: p.stats.ConnectionsCreated,
 		ConnectionsClosed:  p.stats.ConnectionsClosed,
 		GetRequests:        p.stats.GetRequests,
 		GetSuccesses:       p.stats.GetSuccesses,
 		GetTimeouts:        p.stats.GetTimeouts,
 	}
-}
-
-// GetHelloV3Response 获取缓存的HELLO 3响应
-func (p *DedicatedConnectionPool) GetHelloV3Response() string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.helloV3Cache
 }
 
 // Close 关闭连接池
