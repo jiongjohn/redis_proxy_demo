@@ -16,12 +16,12 @@ server:
 
 # 专用连接池配置
 dedicated_proxy:
-  max_connections: 100      # 最大Redis连接数
-  init_connections: 10      # 初始连接数
-  wait_timeout: "5s"        # 获取连接等待超时
-  idle_timeout: "5m"        # 连接空闲超时
-  session_timeout: "10m"    # 客户端会话超时
-  command_timeout: "30s"    # Redis命令执行超时
+  max_connections: 200      # 最大Redis连接数（增加）
+  init_connections: 20      # 初始连接数（增加）
+  wait_timeout: "2s"        # 获取连接等待超时（减少，快速失败）
+  idle_timeout: "3m"        # 连接空闲超时（减少，更快回收）
+  session_timeout: "5m"     # 客户端会话超时（减少）
+  command_timeout: "10s"    # Redis命令执行超时（减少）
   default_database: 0       # 默认数据库
   default_client_name: "redis-proxy-dedicated"  # 默认客户端名称
   stats_interval: "30s"     # 统计报告间隔
