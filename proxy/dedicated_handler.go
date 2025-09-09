@@ -16,6 +16,18 @@ import (
 	"redis-proxy-demo/redis/proto"
 )
 
+// ConnectionContext 表示连接上下文信息
+type ConnectionContext struct {
+	Database        int    // 数据库编号
+	Username        string // 用户名（Redis 6.0+）
+	Password        string // 密码（Redis 6.0+ 支持用户名/密码）
+	ClientName      string // 客户端名称
+	ProtocolVersion int    // 协议版本
+	// 客户端跟踪（RESP3 Client Tracking）简单支持
+	TrackingEnabled bool   // 是否开启跟踪
+	TrackingOptions string // 额外跟踪选项（简化存储原始参数）
+}
+
 // DedicatedClientSession 专用客户端会话
 type DedicatedClientSession struct {
 	ID           string
@@ -195,7 +207,7 @@ func (h *DedicatedHandler) createSession(clientConn net.Conn) *DedicatedClientSe
 	h.stats.SessionsCreated++
 	h.stats.mu.Unlock()
 
-	logger.Debug(fmt.Sprintf("创建会话: %s, 上下文: %s", sessionID, connCtx.Hash()))
+	logger.Debug(fmt.Sprintf("创建会话: %s, 上下文: %v", sessionID, connCtx))
 	return session
 }
 

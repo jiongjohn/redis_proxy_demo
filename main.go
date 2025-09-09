@@ -76,9 +76,6 @@ func main() {
 	if c.Server.UseDedicatedProxy {
 		serverType = "Dedicated Connection Pool Proxy"
 		connectionMode = "1:1 Client-Redis Binding with Pool Management"
-	} else if c.Server.UseIntelligentPool {
-		serverType = "Intelligent Connection Pool Proxy"
-		connectionMode = "NORMAL/INIT/SESSION Command Classification"
 	} else if c.Server.UseAffinity {
 		serverType = "Connection Affinity"
 		connectionMode = "1:1 Connection Mapping"
@@ -110,26 +107,6 @@ func main() {
 		fmt.Printf("├── Redis Protocol Support: ✅ RESP2/RESP3 + Full Commands\n")
 		fmt.Printf("├── Session Isolation: ✅ Complete Client Isolation\n")
 		fmt.Printf("└── Resource Control: ✅ Strict Connection Limits\n")
-	} else if c.Server.UseIntelligentPool {
-		// Show intelligent pool specific configuration
-		fmt.Printf("├── Max Pool Size: %d\n", c.IntelligentPool.MaxPoolSize)
-		fmt.Printf("├── Min Idle Connections: %d\n", c.IntelligentPool.MinIdleConns)
-		fmt.Printf("├── Max Idle Connections: %d\n", c.IntelligentPool.MaxIdleConns)
-		fmt.Printf("├── Session Timeout: %s\n", c.IntelligentPool.SessionTimeout)
-		fmt.Printf("├── Command Classification: ✅ NORMAL/INIT/SESSION\n")
-		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
-		fmt.Printf("├── Transaction Support: ✅ MULTI/EXEC with Session State\n")
-		fmt.Printf("└── Smart Resource Management: ✅ Context-based Pooling\n")
-	} else if c.Server.UseOptimizedAffinity {
-		// Show optimized affinity-specific configuration
-		fmt.Printf("├── Max Client Connections: %d\n", c.ConnectionAffinity.MaxConnections)
-		fmt.Printf("├── Pre-Connection Pool Size: %d\n", c.ConnectionAffinity.PrePoolSize)
-		fmt.Printf("├── Prewarm Connections: %d\n", c.ConnectionAffinity.PrewarmConnections)
-		fmt.Printf("├── Idle Timeout: %s\n", c.ConnectionAffinity.IdleTimeout)
-		fmt.Printf("├── Connect Timeout: %s\n", c.ConnectionAffinity.ConnectTimeout)
-		fmt.Printf("├── WATCH Commands: ✅ Fully Supported\n")
-		fmt.Printf("├── Transaction Commands: ✅ MULTI/EXEC Supported\n")
-		fmt.Printf("└── Zero Connection Latency: ✅ Pre-Connection Pool\n")
 	} else if c.Server.UseAffinity {
 		// Show traditional affinity-specific configuration
 		fmt.Printf("├── Max Client Connections: %d\n", c.Server.MaxConnections)
@@ -138,7 +115,6 @@ func main() {
 		fmt.Printf("└── Transaction Commands: ✅ MULTI/EXEC Supported\n")
 	}
 
-	fmt.Printf("\n🚀 Starting Redis Proxy Server...path:%s,config :%+v \n", *configFile, c.IntelligentPool)
 	// Create appropriate server based on configuration
 	if c.Server.UseDedicatedProxy {
 		// Parse DedicatedProxy configuration durations
@@ -184,69 +160,6 @@ func main() {
 
 		// Keep the server running
 		select {}
-	} else if c.Server.UseIntelligentPool {
-		// Parse IntelligentPool configuration durations
-		idleTimeout, _ := time.ParseDuration(c.IntelligentPool.IdleTimeout)
-		maxLifetime, _ := time.ParseDuration(c.IntelligentPool.MaxLifetime)
-		cleanupInterval, _ := time.ParseDuration(c.IntelligentPool.CleanupInterval)
-		sessionTimeout, _ := time.ParseDuration(c.IntelligentPool.SessionTimeout)
-		commandTimeout, _ := time.ParseDuration(c.IntelligentPool.CommandTimeout)
-		connectionHoldTime, _ := time.ParseDuration(c.IntelligentPool.ConnectionHoldTime)
-
-		// Use intelligent connection pool server with detailed configuration
-		server, err := proxy.NewPoolServerWithDetailedConfig(
-			proxyConfig,
-			c.IntelligentPool.MaxPoolSize,
-			c.IntelligentPool.MinIdleConns,
-			c.IntelligentPool.MaxIdleConns,
-			idleTimeout,
-			maxLifetime,
-			cleanupInterval,
-			sessionTimeout,
-			commandTimeout,
-			connectionHoldTime,
-		)
-		if err != nil {
-			log.Fatalf("Failed to create intelligent pool proxy server: %v", err)
-		}
-
-		logx.Info("🚀 Intelligent Connection Pool Proxy starting...")
-		logx.Info("✅ Command Classification: NORMAL/INIT/SESSION")
-		logx.Info("✅ Smart Connection Reuse Based on Context")
-		logx.Info("✅ Optimized Resource Management")
-		logx.Info(fmt.Sprintf("🔗 Connection Hold Time: %v", connectionHoldTime))
-		logx.Info("🧠 Proto Library RESP Parsing")
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Failed to start intelligent pool proxy server: %v", err)
-		}
-	} else if c.Server.UseOptimizedAffinity {
-		// Parse optimized affinity configuration durations
-		idleTimeout, _ := time.ParseDuration(c.ConnectionAffinity.IdleTimeout)
-		healthCheckInterval, _ := time.ParseDuration(c.ConnectionAffinity.HealthCheckInterval)
-
-		// Use optimized affinity server with pre-connection pool
-		server, err := proxy.NewOptimizedAffinityServerWithFullConfig(
-			proxyConfig,
-			proxyConfig.RedisAddr,
-			proxyConfig.RedisPassword,
-			c.ConnectionAffinity.MaxConnections,
-			c.ConnectionAffinity.PrePoolSize,
-			c.ConnectionAffinity.PrewarmConnections,
-			idleTimeout,
-			healthCheckInterval,
-		)
-		if err != nil {
-			log.Fatalf("Failed to create optimized affinity proxy server: %v", err)
-		}
-
-		logx.Info("🚀 优化的连接亲和性Redis代理启动中...")
-		logx.Info("✅ WATCH/MULTI/EXEC命令完全支持")
-		logx.Info("⚡ 零连接建立延迟 - 预连接池优化")
-		logx.Info(fmt.Sprintf("🏊 预连接池大小: %d", c.ConnectionAffinity.PrePoolSize))
-		logx.Info(fmt.Sprintf("🔥 预热连接数: %d", c.ConnectionAffinity.PrewarmConnections))
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatalf("Failed to start optimized affinity proxy server: %v", err)
-		}
 	} else if c.Server.UseAffinity {
 		// Use connection affinity server for WATCH command support
 		server, err := proxy.NewAffinityServerWithFullConfig(
