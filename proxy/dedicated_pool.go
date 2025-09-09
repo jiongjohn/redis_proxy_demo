@@ -718,21 +718,6 @@ func (p *DedicatedConnectionPool) GetHelloV3Response() string {
 	return p.helloV3Cache
 }
 
-//// GetHelloResponse 从管理器按协议版本获取HELLO缓存
-//func (pm *DedicatedConnectionPool) GetHelloResponse(protoVer int) string {
-//	pm.mu.RLock()
-//	defer pm.mu.RUnlock()
-//	for _, pool := range pm.pools {
-//		if pool.context != nil && pool.context.ProtocolVersion == protoVer {
-//			resp := pool.GetHelloResponse()
-//			if resp != "" {
-//				return resp
-//			}
-//		}
-//	}
-//	return ""
-//}
-
 // Close 关闭连接池
 func (p *DedicatedConnectionPool) Close() error {
 	atomic.StoreInt32(&p.closed, 1)

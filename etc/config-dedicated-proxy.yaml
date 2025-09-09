@@ -19,7 +19,7 @@ dedicated_proxy:
   max_connections: 100      # 最大Redis连接数
   init_connections: 10      # 初始连接数
   wait_timeout: "5s"        # 获取连接等待超时
-  idle_timeout: "30s"        # 连接空闲超时
+  idle_timeout: "5m"        # 连接空闲超时
   session_timeout: "10m"    # 客户端会话超时
   command_timeout: "30s"    # Redis命令执行超时
   default_database: 0       # 默认数据库

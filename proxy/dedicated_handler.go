@@ -327,10 +327,12 @@ func (h *DedicatedHandler) ForwardOneRESPResponseWithProto(redisConn net.Conn, c
 	// 创建proto.Reader，使用流式转发器作为数据源
 	protoReader := proto.NewReaderSize(streamForwarder, 64*1024)
 
-	// 解析一个完整的RESP响应，数据在解析过程中直接转发
-	_, err := protoReader.ReadReply()
+	// // 解析一个完整的RESP响应，数据在解析过程中直接转发
+	//_, err := protoReader.ReadReply()
+	// 只判断边界，不解析数据内容, 数据在解析过程中直接转发
+	err := protoReader.DiscardNext()
 	if err != nil {
-		return fmt.Errorf("流式解析RESP响应失败: %w", err)
+		return fmt.Errorf("流式跳过RESP响应失败: %w", err)
 	}
 
 	return nil
@@ -377,12 +379,12 @@ func (h *DedicatedHandler) forwardResponseWithProto(session *DedicatedClientSess
 
 // isInitCommand 判断是否是初始化命令
 func (h *DedicatedHandler) isInitCommand(commandName string) bool {
-	if commandName == "" || commandName == "CLIENT" {
+	if commandName == "" {
 		// hello 暂时不处理
 		return false
 	}
 	switch commandName {
-	case "SELECT", "AUTH", "HELLO", "CLIENT":
+	case "SELECT", "AUTH", "HELLO":
 		return true
 	default:
 		return false
