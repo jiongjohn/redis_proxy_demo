@@ -21,7 +21,7 @@ dedicated_proxy:
   wait_timeout: "2s"        # 获取连接等待超时（减少，快速失败）
   idle_timeout: "3m"        # 连接空闲超时（减少，更快回收）
   session_timeout: "5m"     # 客户端会话超时（减少）
-  command_timeout: "10s"    # Redis命令执行超时（减少）
+  command_timeout: "30s"    # Redis命令执行超时（适当放宽，降低高并发下误超时）
   default_database: 0       # 默认数据库
   default_client_name: "redis-proxy-dedicated"  # 默认客户端名称
   stats_interval: "30s"     # 统计报告间隔
