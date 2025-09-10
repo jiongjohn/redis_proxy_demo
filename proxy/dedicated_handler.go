@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,6 +38,7 @@ type DedicatedClientSession struct {
 	CreatedAt    time.Time
 	LastActivity time.Time
 	CommandCount int64
+	isInline     bool
 	mu           sync.RWMutex
 }
 
@@ -143,7 +145,7 @@ func (h *DedicatedHandler) Handle(ctx context.Context, clientConn net.Conn) {
 		}
 
 		// 解析命令并保存原始数据
-		args, rawData, err := h.parseCommandWithRaw(reader)
+		args, rawData, err := h.parseCommandWithRaw(session, reader)
 		if err != nil {
 			if h.isConnectionClosed(err) {
 				logger.Info(fmt.Sprintf("客户端连接关闭: %s", clientConn.RemoteAddr()))
@@ -160,6 +162,11 @@ func (h *DedicatedHandler) Handle(ctx context.Context, clientConn net.Conn) {
 		// 处理命令
 		err = h.handleCommand(session, args, rawData)
 		if err != nil {
+			// 如果客户端已关闭/重置，直接结束会话，避免在已开始流式转发后再回写错误帧
+			if h.isConnectionClosed(err) {
+				logger.Info(fmt.Sprintf("客户端连接关闭: %s", clientConn.RemoteAddr()))
+				return
+			}
 			logger.Error(fmt.Sprintf("处理命令失败: %v", err))
 			h.sendError(clientConn, err)
 			// 根据错误类型决定是否断开连接
@@ -258,7 +265,7 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 		return nil
 	}
 
-	logger.Debug(fmt.Sprintf("📝 会话 %s 执行命令: %s %v", session.ID, commandName, args[1:]))
+	logger.Debug(fmt.Sprintf("📝 [inline=%t]会话 %s 执行命令: %s %v", session.isInline, session.ID, commandName, args[1:]))
 
 	// 确保有Redis连接（优化：减少不必要的连接获取）
 	if session.RedisConn == nil {
@@ -270,6 +277,9 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 		// 连接成功获取后，记录日志（仅在获取新连接时）
 		logger.Debug(fmt.Sprintf("会话 %s 获取新Redis连接", session.ID))
 	}
+
+	// 决定是否使用流式转发：对小/简单回复命令（如GET/SET/PING）走非流式，以适配 redis-benchmark
+	//useStreaming := h.shouldUseStreaming(args)
 
 	// 转发命令到Redis
 	err := h.forwardCommandRaw(session, rawData)
@@ -288,24 +298,33 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 // ForwardOneRESPResponseWithProto 基于proto库的零缓冲流式转发
 // 直接在解析过程中转发数据块，无需中间缓冲区
 func (h *DedicatedHandler) ForwardOneRESPResponseWithProto(redisConn net.Conn, clientConn net.Conn, timeout time.Duration) error {
-	// 设置读超时
-	redisConn.SetReadDeadline(time.Now().Add(timeout))
-	defer redisConn.SetDeadline(time.Time{})
-
-	// 创建流式转发器
+	// 创建流式转发器，使用滑动读超时，避免一次性deadline导致长响应中途超时
 	streamForwarder := &StreamForwarder{
-		source: redisConn,
-		target: clientConn,
+		source:      redisConn,
+		target:      clientConn,
+		readTimeout: timeout,
 	}
 
 	// 创建proto.Reader，使用流式转发器作为数据源
 	protoReader := proto.NewReaderSize(streamForwarder, 64*1024)
 
-	// // 解析一个完整的RESP响应，数据在解析过程中直接转发
+	// 使用 ReadReply 进行流式解析，虽然性能略低于 DiscardNext，但保证正确性
+	// 在流式转发场景中，数据已经被转发，我们只需要确保协议解析正确
 	_, err := protoReader.ReadReply()
-	// 只判断边界，不解析数据内容, 数据在解析过程中直接转发
-	//err := protoReader.DiscardNext()
 	if err != nil {
+		// proto.Nil 不是错误，是正常的 Redis nil 响应（如 GET 不存在的 key，SPOP 空集合等）
+		if errors.Is(err, proto.Nil) {
+			return nil
+		}
+
+		// 客户端在流式写入过程中断开属于正常情况，不再作为解析错误对待
+		errStr := err.Error()
+		if strings.Contains(errStr, "broken pipe") ||
+			strings.Contains(errStr, "use of closed network connection") ||
+			strings.Contains(errStr, "connection reset by peer") ||
+			strings.Contains(errStr, "EOF") {
+			return err
+		}
 		return fmt.Errorf("流式跳过RESP响应失败: %w", err)
 	}
 
@@ -315,12 +334,17 @@ func (h *DedicatedHandler) ForwardOneRESPResponseWithProto(redisConn net.Conn, c
 // StreamForwarder 实现io.Reader接口的流式转发器
 // 在读取数据的同时直接转发到目标连接，无需缓冲
 type StreamForwarder struct {
-	source io.Reader // 数据源（Redis连接）
-	target io.Writer // 数据目标（客户端连接）
+	source      io.Reader // 数据源（Redis连接）
+	target      io.Writer // 数据目标（客户端连接）
+	readTimeout time.Duration
 }
 
 // Read 实现io.Reader接口，读取数据的同时直接转发
 func (sf *StreamForwarder) Read(p []byte) (n int, err error) {
+	// 滑动读超时：每次读取前刷新源连接的读deadline，避免中长响应中途超时
+	if c, ok := sf.source.(net.Conn); ok && sf.readTimeout > 0 {
+		c.SetReadDeadline(time.Now().Add(sf.readTimeout))
+	}
 	// 从源读取数据
 	n, err = sf.source.Read(p)
 	if err != nil {
@@ -329,6 +353,11 @@ func (sf *StreamForwarder) Read(p []byte) (n int, err error) {
 
 	// 如果读取到数据，立即转发到目标
 	if n > 0 {
+		// 尝试为写入设置较短的写超时，避免客户端阻塞导致长期挂起
+		if c, ok := sf.target.(net.Conn); ok {
+			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			defer c.SetWriteDeadline(time.Time{})
+		}
 		written, writeErr := sf.target.Write(p[:n])
 		if writeErr != nil {
 			return written, writeErr
@@ -365,12 +394,59 @@ func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, ra
 		return fmt.Errorf("发送命令到Redis失败: %w", err)
 	}
 
+	if session.isInline {
+		return h.forwardResponse(session)
+	}
 	// 使用proto库的流式转发
 	return h.forwardResponseWithProto(session)
 }
 
+// forwardResponse 零拷贝高性能转发Redis响应到客户端
+func (h *DedicatedHandler) forwardResponse(session *DedicatedClientSession) error {
+	// 使用io.Copy进行零拷贝转发，但需要处理超时
+	session.RedisConn.conn.SetReadDeadline(time.Now().Add(h.config.CommandTimeout))
+	defer session.RedisConn.conn.SetDeadline(time.Time{})
+
+	// 使用更大的缓冲区，一次性读写
+	buffer := make([]byte, 65536) // 64KB缓冲区，减少系统调用
+	totalBytes := 0
+
+	for {
+		// 设置较短的读超时来快速检测响应结束
+		if totalBytes > 0 {
+			session.RedisConn.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+		}
+
+		n, err := session.RedisConn.conn.Read(buffer)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if totalBytes > 0 {
+					break // 已读取数据，超时表示结束
+				}
+				return fmt.Errorf("读取Redis响应超时")
+			}
+			if err == io.EOF && totalBytes > 0 {
+				break
+			}
+			return fmt.Errorf("读取Redis响应失败: %w", err)
+		}
+
+		if n > 0 {
+			totalBytes += n
+			// 直接写入，避免额外拷贝
+			if _, err = session.ClientConn.Write(buffer[:n]); err != nil {
+				return fmt.Errorf("发送响应失败: %w", err)
+			}
+		} else {
+			break
+		}
+	}
+
+	return nil
+}
+
 // parseCommandWithRaw 解析客户端命令并保存原始数据
-func (h *DedicatedHandler) parseCommandWithRaw(reader *bufio.Reader) ([]string, []byte, error) {
+func (h *DedicatedHandler) parseCommandWithRaw(session *DedicatedClientSession, reader *bufio.Reader) ([]string, []byte, error) {
 	// 检查第一个字节以判断命令格式
 	firstByte, err := reader.Peek(1)
 	if err != nil {
@@ -395,6 +471,7 @@ func (h *DedicatedHandler) parseCommandWithRaw(reader *bufio.Reader) ([]string, 
 			return nil, nil, err
 		}
 
+		session.UpdateIsInline(false)
 		return args, rawBuffer.Bytes(), nil
 
 	default:
@@ -414,7 +491,7 @@ func (h *DedicatedHandler) parseCommandWithRaw(reader *bufio.Reader) ([]string, 
 		if len(parts) == 0 {
 			return []string{}, line, nil
 		}
-
+		session.UpdateIsInline(true)
 		return parts, line, nil
 	}
 }
@@ -438,6 +515,25 @@ func (h *DedicatedHandler) convertToArgs(cmd interface{}) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("unsupported command format: %T", cmd)
 	}
+}
+
+// shouldUseStreaming 针对可能很大的响应或未知响应结构使用流式；
+// 对常见小响应命令（redis-benchmark 典型：GET/SET/PING/INCR/DECR/DEL/EXISTS）禁用流式
+func (h *DedicatedHandler) shouldUseStreaming(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	cmd := strings.ToUpper(args[0])
+	switch cmd {
+	case "GET", "SET", "PING", "INCR", "DECR", "DEL", "EXISTS", "GETSET":
+		return false
+	}
+	// 对可能有大包或未知大小的命令启用流式
+	switch cmd {
+	case "MGET", "MSET", "SCAN", "HGETALL", "LRANGE", "SRANDMEMBER", "ZRANGE", "ZSCORE", "ZSCAN", "SSCAN", "HSCAN":
+		return true
+	}
+	return true
 }
 
 // resetSessionConnection 重置会话连接
@@ -639,4 +735,14 @@ func (s *DedicatedClientSession) UpdateLastActivity() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.LastActivity = time.Now()
+}
+
+// UpdateIsInline
+func (s *DedicatedClientSession) UpdateIsInline(isInline bool) {
+	if s.isInline == isInline {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.isInline = isInline
 }
