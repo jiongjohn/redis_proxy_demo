@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -278,10 +279,10 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 	}
 
 	// 决定是否使用流式转发：对小/简单回复命令（如GET/SET/PING）走非流式，以适配 redis-benchmark
-	useStreaming := h.shouldUseStreaming(args)
+	//useStreaming := h.shouldUseStreaming(args)
 
 	// 转发命令到Redis
-	err := h.forwardCommandRaw(session, rawData, useStreaming)
+	err := h.forwardCommandRaw(session, rawData)
 	if err != nil {
 		// 连接出错，释放连接
 		if session.RedisConn != nil {
@@ -307,11 +308,15 @@ func (h *DedicatedHandler) ForwardOneRESPResponseWithProto(redisConn net.Conn, c
 	// 创建proto.Reader，使用流式转发器作为数据源
 	protoReader := proto.NewReaderSize(streamForwarder, 64*1024)
 
-	// // 解析一个完整的RESP响应，数据在解析过程中直接转发
-	//_, err := protoReader.ReadReply()
-	// 只判断边界，不解析数据内容, 数据在解析过程中直接转发
-	err := protoReader.DiscardNext()
+	// 使用 ReadReply 进行流式解析，虽然性能略低于 DiscardNext，但保证正确性
+	// 在流式转发场景中，数据已经被转发，我们只需要确保协议解析正确
+	_, err := protoReader.ReadReply()
 	if err != nil {
+		// proto.Nil 不是错误，是正常的 Redis nil 响应（如 GET 不存在的 key，SPOP 空集合等）
+		if errors.Is(err, proto.Nil) {
+			return nil
+		}
+
 		// 客户端在流式写入过程中断开属于正常情况，不再作为解析错误对待
 		errStr := err.Error()
 		if strings.Contains(errStr, "broken pipe") ||
@@ -376,7 +381,7 @@ func (h *DedicatedHandler) forwardResponseWithProto(session *DedicatedClientSess
 }
 
 // forwardCommandRaw 转发原始命令数据到Redis
-func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, rawData []byte, useStreaming bool) error {
+func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, rawData []byte) error {
 	if session.RedisConn == nil {
 		return fmt.Errorf("没有可用的Redis连接")
 	}
@@ -389,11 +394,11 @@ func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, ra
 		return fmt.Errorf("发送命令到Redis失败: %w", err)
 	}
 
-	//if useStreaming {
-	//	// 使用proto库的流式转发
-	//	return h.forwardResponseWithProto(session)
-	//}
-	return h.forwardResponse(session)
+	if session.isInline {
+		return h.forwardResponse(session)
+	}
+	// 使用proto库的流式转发
+	return h.forwardResponseWithProto(session)
 }
 
 // forwardResponse 零拷贝高性能转发Redis响应到客户端
