@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"redis-proxy-demo/pool"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,24 +18,12 @@ import (
 	"redis-proxy-demo/redis/proto"
 )
 
-// ConnectionContext 表示连接上下文信息
-type ConnectionContext struct {
-	Database        int    // 数据库编号
-	Username        string // 用户名（Redis 6.0+）
-	Password        string // 密码（Redis 6.0+ 支持用户名/密码）
-	ClientName      string // 客户端名称
-	ProtocolVersion int    // 协议版本
-	// 客户端跟踪（RESP3 Client Tracking）简单支持
-	TrackingEnabled bool   // 是否开启跟踪
-	TrackingOptions string // 额外跟踪选项（简化存储原始参数）
-}
-
 // DedicatedClientSession 专用客户端会话
 type DedicatedClientSession struct {
 	ID           string
 	ClientConn   net.Conn
-	RedisConn    *DedicatedConnection
-	Context      *ConnectionContext
+	RedisConn    *pool.DedicatedConnection
+	Context      *pool.ConnectionContext
 	CreatedAt    time.Time
 	LastActivity time.Time
 	CommandCount int64
@@ -44,7 +33,7 @@ type DedicatedClientSession struct {
 
 // DedicatedHandler 专用处理器
 type DedicatedHandler struct {
-	pool           *DedicatedConnectionPool
+	pool           *pool.DedicatedConnectionPool
 	sessions       map[net.Conn]*DedicatedClientSession
 	sessionCounter int64
 	config         DedicatedHandlerConfig
@@ -85,7 +74,7 @@ func NewDedicatedHandler(config DedicatedHandlerConfig) (*DedicatedHandler, erro
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// 创建连接池
-	poolConfig := DedicatedPoolConfig{
+	poolConfig := pool.DedicatedPoolConfig{
 		RedisAddr:     config.RedisAddr,
 		RedisPassword: config.RedisPassword,
 		MaxSize:       config.MaxConnections,
@@ -94,7 +83,7 @@ func NewDedicatedHandler(config DedicatedHandlerConfig) (*DedicatedHandler, erro
 		IdleTimeout:   config.IdleTimeout,
 	}
 
-	pool, err := NewDedicatedConnectionPool(poolConfig)
+	pool, err := pool.NewDedicatedConnectionPool(poolConfig)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("创建连接池失败: %w", err)
@@ -186,7 +175,7 @@ func (h *DedicatedHandler) createSession(clientConn net.Conn) *DedicatedClientSe
 	sessionID := fmt.Sprintf("dedicated_session_%d", h.sessionCounter)
 
 	// 创建默认连接上下文
-	connCtx := &ConnectionContext{
+	connCtx := &pool.ConnectionContext{
 		Database:        h.config.DefaultDatabase,
 		Username:        "",
 		Password:        "",
@@ -377,7 +366,7 @@ func (h *DedicatedHandler) forwardResponseWithProto(session *DedicatedClientSess
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return h.ForwardOneRESPResponseWithProto(session.RedisConn.conn, session.ClientConn, timeout)
+	return h.ForwardOneRESPResponseWithProto(session.RedisConn.Conn, session.ClientConn, timeout)
 }
 
 // forwardCommandRaw 转发原始命令数据到Redis
@@ -387,10 +376,10 @@ func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, ra
 	}
 
 	// 优化：减少超时设置的系统调用开销
-	session.RedisConn.conn.SetWriteDeadline(time.Now().Add(h.config.CommandTimeout))
+	session.RedisConn.Conn.SetWriteDeadline(time.Now().Add(h.config.CommandTimeout))
 
 	// 直接发送原始数据到Redis
-	if _, err := session.RedisConn.conn.Write(rawData); err != nil {
+	if _, err := session.RedisConn.Conn.Write(rawData); err != nil {
 		return fmt.Errorf("发送命令到Redis失败: %w", err)
 	}
 
@@ -404,8 +393,8 @@ func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, ra
 // forwardResponse 零拷贝高性能转发Redis响应到客户端
 func (h *DedicatedHandler) forwardResponse(session *DedicatedClientSession) error {
 	// 使用io.Copy进行零拷贝转发，但需要处理超时
-	session.RedisConn.conn.SetReadDeadline(time.Now().Add(h.config.CommandTimeout))
-	defer session.RedisConn.conn.SetDeadline(time.Time{})
+	session.RedisConn.Conn.SetReadDeadline(time.Now().Add(h.config.CommandTimeout))
+	defer session.RedisConn.Conn.SetDeadline(time.Time{})
 
 	// 使用更大的缓冲区，一次性读写
 	buffer := make([]byte, 65536) // 64KB缓冲区，减少系统调用
@@ -414,10 +403,10 @@ func (h *DedicatedHandler) forwardResponse(session *DedicatedClientSession) erro
 	for {
 		// 设置较短的读超时来快速检测响应结束
 		if totalBytes > 0 {
-			session.RedisConn.conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+			session.RedisConn.Conn.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
 		}
 
-		n, err := session.RedisConn.conn.Read(buffer)
+		n, err := session.RedisConn.Conn.Read(buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				if totalBytes > 0 {
@@ -725,9 +714,7 @@ func (s *DedicatedClientSession) SetLastCommand(cmd string) {
 
 // IncrementCommandCount 增加命令计数
 func (s *DedicatedClientSession) IncrementCommandCount() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.CommandCount++
+	atomic.AddInt64(&s.CommandCount, 1)
 }
 
 // UpdateLastActivity 更新最后活动时间

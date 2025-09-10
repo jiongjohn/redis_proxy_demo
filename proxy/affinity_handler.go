@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"redis-proxy-demo/pool"
 	"sync"
 	"time"
 
@@ -143,37 +144,13 @@ func (h *AffinityHandler) Handle(ctx context.Context, clientConn net.Conn) {
 
 // createRedisConnection creates a new Redis connection
 func (h *AffinityHandler) createRedisConnection() (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", h.config.RedisAddr, 10*time.Second)
+	conn, err := pool.CreateConnection(&pool.RedisConnConfig{
+		Addr:     h.config.RedisAddr,
+		Password: h.config.RedisPassword,
+	})
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
-	}
-
-	// Handle Redis authentication if required
-	if h.config.RedisPassword != "" {
-		authCmd := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n",
-			len(h.config.RedisPassword), h.config.RedisPassword)
-
-		_, err = conn.Write([]byte(authCmd))
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to send AUTH command: %w", err)
-		}
-
-		// Read AUTH response
-		buffer := make([]byte, 1024)
-		n, err := conn.Read(buffer)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to read AUTH response: %w", err)
-		}
-
-		response := string(buffer[:n])
-		if !contains(response, "+OK") {
-			conn.Close()
-			return nil, fmt.Errorf("Redis authentication failed: %s", response)
-		}
-
-		logger.Debug("Redis authentication successful")
 	}
 
 	return conn, nil

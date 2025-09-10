@@ -30,13 +30,6 @@ redis:
   read_timeout: 3s
   write_timeout: 3s
 
-cache:
-  enabled: true
-  max_size: 256MB
-  ttl: 300s
-  eviction_policy: lru
-  cleanup_interval: 60s
-
 kafka:
   enabled: true
   brokers:

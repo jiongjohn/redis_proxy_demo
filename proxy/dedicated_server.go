@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"redis-proxy-demo/pool"
 	"sync"
 	"time"
 
@@ -269,7 +270,7 @@ func (s *DedicatedServer) GetHandlerStats() DedicatedHandlerStats {
 }
 
 // GetPoolStats 获取连接池统计信息
-func (s *DedicatedServer) GetPoolStats() DedicatedPoolStats {
+func (s *DedicatedServer) GetPoolStats() pool.DedicatedPoolStats {
 	return s.handler.pool.GetStats()
 }
 

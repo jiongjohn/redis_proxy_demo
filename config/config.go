@@ -51,11 +51,13 @@ type Config struct {
 	} `json:"redis"`
 
 	Cache struct {
-		Enabled         bool   `json:",default=true"`
-		MaxSize         string `json:",default=256MB"`
-		TTL             string `json:",default=300s"`
-		EvictionPolicy  string `json:",default=lru"`
-		CleanupInterval string `json:",default=60s"`
+		Enabled         bool   `json:"enabled,default=true"`
+		MaxSize         int    `json:"max_size,default=10000"`       // Maximum number of cached items
+		TTL             string `json:"ttl,default=60s"`              // Time to live for cached items
+		EnableTTL       bool   `json:"enable_ttl,default=true"`      // Enable TTL-based expiration
+		EvictionPolicy  string `json:"eviction_policy,default=lru"`  // Eviction policy (lru, lfu, etc.)
+		EnableStats     bool   `json:"enable_stats,default=true"`    // Enable cache statistics
+		CleanupInterval string `json:"cleanup_interval,default=60s"` // Cleanup interval for expired items
 	} `json:"cache"`
 
 	Kafka struct {

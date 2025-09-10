@@ -1,4 +1,4 @@
-package proxy
+package pool
 
 import (
 	"context"
@@ -11,9 +11,21 @@ import (
 	"redis-proxy-demo/lib/logger"
 )
 
+// ConnectionContext 表示连接上下文信息
+type ConnectionContext struct {
+	Database        int    // 数据库编号
+	Username        string // 用户名（Redis 6.0+）
+	Password        string // 密码（Redis 6.0+ 支持用户名/密码）
+	ClientName      string // 客户端名称
+	ProtocolVersion int    // 协议版本
+	// 客户端跟踪（RESP3 Client Tracking）简单支持
+	TrackingEnabled bool   // 是否开启跟踪
+	TrackingOptions string // 额外跟踪选项（简化存储原始参数）
+}
+
 // DedicatedConnection 专用连接
 type DedicatedConnection struct {
-	conn        net.Conn
+	Conn        net.Conn
 	id          string
 	createdAt   time.Time
 	lastUsed    int64 // Unix纳秒时间戳，使用原子操作
@@ -223,22 +235,19 @@ func (p *DedicatedConnectionPool) tryCreateConnection(clientID string, connCtx *
 
 // createConnection 创建新连接
 func (p *DedicatedConnectionPool) createConnection() (*DedicatedConnection, error) {
-	conn, err := net.DialTimeout("tcp", p.redisAddr, 5*time.Second)
+	conn, err := CreateConnection(&RedisConnConfig{
+		Addr:     p.redisAddr,
+		Password: p.redisPassword,
+	})
+
 	if err != nil {
 		return nil, err
-	}
-
-	// TCP优化
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	connID := fmt.Sprintf("dedicated_%d", time.Now().UnixNano())
 
 	return &DedicatedConnection{
-		conn:      conn,
+		Conn:      conn,
 		id:        connID,
 		createdAt: time.Now(),
 		lastUsed:  time.Now().UnixNano(),
@@ -303,7 +312,7 @@ func (p *DedicatedConnectionPool) ReleaseConnection(conn *DedicatedConnection) {
 
 // isConnectionValid 检查连接是否有效
 func (p *DedicatedConnectionPool) isConnectionValid(conn *DedicatedConnection) bool {
-	if conn == nil || conn.conn == nil {
+	if conn == nil || conn.Conn == nil {
 		return false
 	}
 
@@ -321,13 +330,13 @@ func (p *DedicatedConnectionPool) isConnectionValid(conn *DedicatedConnection) b
 
 	// 简单的TCP连接状态检查（不发送数据）
 	// 设置一个很短的超时来检查连接是否可写
-	conn.conn.SetWriteDeadline(time.Now().Add(1 * time.Millisecond))
+	conn.Conn.SetWriteDeadline(time.Now().Add(1 * time.Millisecond))
 
 	// 尝试写入0字节来检查连接状态
-	_, err := conn.conn.Write([]byte{})
+	_, err := conn.Conn.Write([]byte{})
 
 	// 立即清除deadline
-	conn.conn.SetDeadline(time.Time{})
+	conn.Conn.SetDeadline(time.Time{})
 
 	if err != nil {
 		logger.Debug(fmt.Sprintf("连接 %s 网络检查失败: %v", conn.id, err))
@@ -356,8 +365,8 @@ func (p *DedicatedConnectionPool) cleanupExpiredConnections() {
 		lastUsed := atomic.LoadInt64(&conn.lastUsed)
 		if lastUsed > 0 && now.Sub(time.Unix(0, lastUsed)) > p.idleTimeout {
 			// 连接过期，只关闭TCP连接，不更新统计（统计会在下面统一更新）
-			if conn.conn != nil {
-				conn.conn.Close()
+			if conn.Conn != nil {
+				conn.Conn.Close()
 			}
 			expiredCount++
 			logger.Debug(fmt.Sprintf("清理过期连接: %s, 最后使用: %v", conn.id, time.Unix(0, lastUsed)))
@@ -396,14 +405,15 @@ func (p *DedicatedConnectionPool) cleanupExpiredConnections() {
 				logger.Debug(fmt.Sprintf("从队列中移除无效连接: %s", conn.id))
 			}
 		default:
-			break
+			// 队列为空，退出循环
+			return
 		}
 	}
 }
 
 // closeConnectionUnsafe 关闭连接（不获取锁，用于已持有锁的场景）
 func (p *DedicatedConnectionPool) closeConnectionUnsafe(conn *DedicatedConnection) {
-	if conn == nil || conn.conn == nil {
+	if conn == nil || conn.Conn == nil {
 		return
 	}
 
@@ -415,7 +425,7 @@ func (p *DedicatedConnectionPool) closeConnectionUnsafe(conn *DedicatedConnectio
 		}
 	}
 
-	conn.conn.Close()
+	conn.Conn.Close()
 
 	// 只更新关闭计数，其他统计基于实际数据计算
 	atomic.AddInt64(&p.stats.ConnectionsClosed, 1)
@@ -425,7 +435,7 @@ func (p *DedicatedConnectionPool) closeConnectionUnsafe(conn *DedicatedConnectio
 
 // closeConnection 关闭连接
 func (p *DedicatedConnectionPool) closeConnection(conn *DedicatedConnection) {
-	if conn == nil || conn.conn == nil {
+	if conn == nil || conn.Conn == nil {
 		return
 	}
 
@@ -440,7 +450,7 @@ func (p *DedicatedConnectionPool) closeConnection(conn *DedicatedConnection) {
 		}
 	}
 
-	conn.conn.Close()
+	conn.Conn.Close()
 
 	// 只更新关闭计数，其他统计基于实际数据计算
 	atomic.AddInt64(&p.stats.ConnectionsClosed, 1)
@@ -531,8 +541,8 @@ func (p *DedicatedConnectionPool) Close() error {
 
 	// 关闭所有连接
 	for _, conn := range p.connections {
-		if conn.conn != nil {
-			conn.conn.Close()
+		if conn.Conn != nil {
+			conn.Conn.Close()
 		}
 	}
 
