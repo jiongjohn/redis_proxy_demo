@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"redis-proxy-demo/config"
 	"redis-proxy-demo/lib/logger"
 )
 
@@ -24,17 +25,18 @@ type DedicatedServer struct {
 
 // DedicatedServerConfig 专用服务器配置
 type DedicatedServerConfig struct {
-	ListenAddr        string        // 监听地址
-	RedisAddr         string        // Redis地址
-	RedisPassword     string        // Redis密码
-	MaxConnections    int           // 最大连接数
-	InitConnections   int           // 初始连接数
-	WaitTimeout       time.Duration // 获取连接等待超时
-	IdleTimeout       time.Duration // 连接空闲超时
-	SessionTimeout    time.Duration // 会话超时
-	CommandTimeout    time.Duration // 命令超时
-	DefaultDatabase   int           // 默认数据库
-	DefaultClientName string        // 默认客户端名
+	ListenAddr        string         // 监听地址
+	RedisAddr         string         // Redis地址
+	RedisPassword     string         // Redis密码
+	MaxConnections    int            // 最大连接数
+	InitConnections   int            // 初始连接数
+	WaitTimeout       time.Duration  // 获取连接等待超时
+	IdleTimeout       time.Duration  // 连接空闲超时
+	SessionTimeout    time.Duration  // 会话超时
+	CommandTimeout    time.Duration  // 命令超时
+	DefaultDatabase   int            // 默认数据库
+	DefaultClientName string         // 默认客户端名
+	CacheConfig       *config.Config // 缓存配置
 }
 
 // DedicatedServerStats 专用服务器统计
@@ -63,6 +65,7 @@ func NewDedicatedServer(config DedicatedServerConfig) (*DedicatedServer, error) 
 		CommandTimeout:    config.CommandTimeout,
 		DefaultDatabase:   config.DefaultDatabase,
 		DefaultClientName: config.DefaultClientName,
+		CacheConfig:       config.CacheConfig,
 	}
 
 	// 创建处理器

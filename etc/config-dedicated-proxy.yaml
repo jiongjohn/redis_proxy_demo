@@ -42,16 +42,18 @@ redis:
 # 缓存配置（可选）
 cache:
   enabled: true                    # 启用本地缓存
-  max_size: 10000                  # 最大缓存项数量
   ttl: "300s"                      # 缓存项生存时间
   enable_ttl: true                 # 启用TTL过期
   eviction_policy: "lru"           # 淘汰策略
   enable_stats: true               # 启用统计信息
   cleanup_interval: "60s"          # 清理间隔
+  hard_max_cache_size: 100         # 总缓存大小限制（MB）
+  max_entry_size: 1048576          # 单条缓存条目大小限制（字节）- 1MB
+  verbose: false                   # 启用BigCache详细日志（调试用）
 
 # Kafka配置（可选）
 kafka:
-  enabled: true                           # 启用Kafka缓存一致性
+  enabled: false                           # 启用Kafka缓存一致性
   brokers: ["localhost:9092"]             # Kafka代理地址
   topic: "redis-cache-events"             # 缓存事件主题
   group_id: "redis-proxy-group"           # 消费者组ID

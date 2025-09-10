@@ -30,7 +30,7 @@ func main() {
 	fmt.Printf("✅ Configuration Summary:\n")
 	fmt.Printf("├── Server: %s:%d (Max Connections: %d)\n", "localhost", c.Server.Port, c.Server.MaxConnections)
 	fmt.Printf("├── Redis: %s:%d (Pool Size: %d)\n", c.Redis.Host, c.Redis.Port, c.Redis.PoolSize)
-	fmt.Printf("├── Cache: %s (Max Size: %s, Policy: %s)\n",
+	fmt.Printf("├── Cache: %s (Max Size: %dMB, Policy: %s)\n",
 		func() string {
 			if c.Cache.Enabled {
 				return "Enabled"
@@ -38,7 +38,7 @@ func main() {
 				return "Disabled"
 			}
 		}(),
-		c.Cache.MaxSize, c.Cache.EvictionPolicy)
+		c.Cache.HardMaxCacheSize, c.Cache.EvictionPolicy)
 	fmt.Printf("├── Kafka: %s (Brokers: %v)\n",
 		func() string {
 			if c.Kafka.Enabled {
@@ -136,6 +136,7 @@ func main() {
 			CommandTimeout:    commandTimeout,
 			DefaultDatabase:   c.DedicatedProxy.DefaultDatabase,
 			DefaultClientName: c.DedicatedProxy.DefaultClientName,
+			CacheConfig:       &c, // 传递完整配置以支持缓存
 		}
 
 		// Create dedicated proxy server

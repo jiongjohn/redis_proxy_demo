@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"redis-proxy-demo/cache"
+	"redis-proxy-demo/config"
 	"redis-proxy-demo/lib/logger"
 	"redis-proxy-demo/redis/proto"
 )
@@ -41,20 +43,22 @@ type DedicatedHandler struct {
 	cancel         context.CancelFunc
 	mu             sync.RWMutex
 	stats          *DedicatedHandlerStats
+	cache          *cache.ConsistentCache // 本地缓存
 }
 
 // DedicatedHandlerConfig 专用处理器配置
 type DedicatedHandlerConfig struct {
 	RedisAddr         string
 	RedisPassword     string
-	MaxConnections    int           // 最大连接数
-	InitConnections   int           // 初始连接数
-	WaitTimeout       time.Duration // 获取连接等待超时
-	IdleTimeout       time.Duration // 连接空闲超时
-	SessionTimeout    time.Duration // 会话超时
-	CommandTimeout    time.Duration // 命令超时
-	DefaultDatabase   int           // 默认数据库
-	DefaultClientName string        // 默认客户端名
+	MaxConnections    int            // 最大连接数
+	InitConnections   int            // 初始连接数
+	WaitTimeout       time.Duration  // 获取连接等待超时
+	IdleTimeout       time.Duration  // 连接空闲超时
+	SessionTimeout    time.Duration  // 会话超时
+	CommandTimeout    time.Duration  // 命令超时
+	DefaultDatabase   int            // 默认数据库
+	DefaultClientName string         // 默认客户端名
+	CacheConfig       *config.Config // 缓存配置
 }
 
 // DedicatedHandlerStats 专用处理器统计
@@ -97,6 +101,22 @@ func NewDedicatedHandler(config DedicatedHandlerConfig) (*DedicatedHandler, erro
 		ctx:            ctx,
 		cancel:         cancel,
 		stats:          &DedicatedHandlerStats{},
+	}
+
+	// 初始化缓存（如果启用）
+	if config.CacheConfig != nil && config.CacheConfig.Cache.Enabled {
+		// 生成实例ID
+		instanceID := fmt.Sprintf("dedicated-proxy-%d", time.Now().UnixNano())
+		consistentCache, err := cache.NewConsistentCache(config.CacheConfig, instanceID)
+		if err != nil {
+			cancel()
+			pool.Close()
+			return nil, fmt.Errorf("初始化缓存失败: %w", err)
+		}
+		handler.cache = consistentCache
+		logger.Info("✅ 本地缓存已启用")
+	} else {
+		logger.Info("ℹ️ 本地缓存已禁用")
 	}
 
 	// 启动会话清理协程（暂时不需要清理， ）
@@ -256,6 +276,42 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 
 	logger.Debug(fmt.Sprintf("📝 [inline=%t]会话 %s 执行命令: %s %v", session.isInline, session.ID, commandName, args[1:]))
 
+	// 缓存处理逻辑
+	if h.cache != nil {
+		// 处理 GET 命令
+		if commandName == "GET" && len(args) >= 2 {
+			key := args[1]
+			if value, found := h.cache.ProcessGET(key); found {
+				// 缓存命中，直接返回
+				logger.Debug(fmt.Sprintf("🎯 缓存命中: %s", key))
+				return h.sendCachedResponse(session, value)
+			}
+			// 缓存未命中，执行Redis查询并更新缓存
+			return h.executeRedisCommandWithCache(session, rawData, "GET", key, "")
+		}
+
+		// 处理 SET 命令
+		if commandName == "SET" && len(args) >= 3 {
+			key := args[1]
+			value := args[2]
+			// 先执行Redis命令，成功后更新缓存
+			err := h.executeRedisCommand(session, rawData)
+			if err != nil {
+				return err
+			}
+			// Redis执行成功，更新缓存
+			h.cache.ProcessSET(key, value, 0) // TTL为0表示使用默认TTL
+			logger.Debug(fmt.Sprintf("💾 缓存更新: %s", key))
+			return nil
+		}
+	}
+
+	// 非缓存命令或缓存未启用，直接执行Redis命令
+	return h.executeRedisCommand(session, rawData)
+}
+
+// executeRedisCommand 执行Redis命令的通用逻辑
+func (h *DedicatedHandler) executeRedisCommand(session *DedicatedClientSession, rawData []byte) error {
 	// 确保有Redis连接（优化：减少不必要的连接获取）
 	if session.RedisConn == nil {
 		conn, err := h.pool.GetConnection(session.ID, session.Context)
@@ -267,9 +323,6 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 		logger.Debug(fmt.Sprintf("会话 %s 获取新Redis连接", session.ID))
 	}
 
-	// 决定是否使用流式转发：对小/简单回复命令（如GET/SET/PING）走非流式，以适配 redis-benchmark
-	//useStreaming := h.shouldUseStreaming(args)
-
 	// 转发命令到Redis
 	err := h.forwardCommandRaw(session, rawData)
 	if err != nil {
@@ -279,6 +332,106 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 			session.RedisConn = nil
 		}
 		return err
+	}
+
+	return nil
+}
+
+// executeRedisCommandWithCache 执行Redis命令并处理缓存更新
+func (h *DedicatedHandler) executeRedisCommandWithCache(session *DedicatedClientSession, rawData []byte, command, key, setValue string) error {
+	// 确保有Redis连接
+	if session.RedisConn == nil {
+		conn, err := h.pool.GetConnection(session.ID, session.Context)
+		if err != nil {
+			return fmt.Errorf("获取Redis连接失败: %w", err)
+		}
+		session.RedisConn = conn
+		logger.Debug(fmt.Sprintf("会话 %s 获取新Redis连接", session.ID))
+	}
+
+	// 发送命令到Redis
+	session.RedisConn.Conn.SetWriteDeadline(time.Now().Add(h.config.CommandTimeout))
+	if _, err := session.RedisConn.Conn.Write(rawData); err != nil {
+		return fmt.Errorf("发送命令到Redis失败: %w", err)
+	}
+
+	// 对于GET命令，需要解析响应并更新缓存
+	if command == "GET" {
+		return h.forwardResponseWithCacheUpdate(session, key)
+	}
+
+	// 对于其他命令，使用标准转发
+	if session.isInline {
+		return h.forwardResponse(session)
+	}
+	return h.forwardResponseWithProto(session)
+}
+
+// forwardResponseWithCacheUpdate 转发响应并更新缓存
+func (h *DedicatedHandler) forwardResponseWithCacheUpdate(session *DedicatedClientSession, key string) error {
+	timeout := h.config.CommandTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	// 设置读超时
+	session.RedisConn.Conn.SetReadDeadline(time.Now().Add(timeout))
+	defer session.RedisConn.Conn.SetDeadline(time.Time{})
+
+	// 创建proto Reader来解析响应
+	protoReader := proto.NewReader(session.RedisConn.Conn)
+
+	// 读取Redis响应
+	reply, err := protoReader.ReadReply()
+	if err != nil {
+		if errors.Is(err, proto.Nil) {
+			// Redis返回nil，发送nil响应给客户端
+			response := "$-1\r\n"
+			_, writeErr := session.ClientConn.Write([]byte(response))
+			return writeErr
+		}
+		return fmt.Errorf("读取Redis响应失败: %w", err)
+	}
+
+	// 将响应转换为RESP格式并发送给客户端
+	var response string
+	if reply == nil {
+		response = "$-1\r\n"
+	} else {
+		replyStr := fmt.Sprintf("%v", reply)
+		response = fmt.Sprintf("$%d\r\n%s\r\n", len(replyStr), replyStr)
+
+		// 更新缓存
+		if h.cache != nil {
+			h.cache.ProcessSET(key, reply, 0) // 使用默认TTL
+			logger.Debug(fmt.Sprintf("💾 GET缓存更新: %s", key))
+		}
+	}
+
+	// 发送响应给客户端
+	_, err = session.ClientConn.Write([]byte(response))
+	if err != nil {
+		return fmt.Errorf("发送响应失败: %w", err)
+	}
+
+	return nil
+}
+
+// sendCachedResponse 发送缓存的响应给客户端
+func (h *DedicatedHandler) sendCachedResponse(session *DedicatedClientSession, value interface{}) error {
+	// 将缓存值转换为RESP格式
+	var response string
+	if value == nil {
+		response = "$-1\r\n" // Redis nil response
+	} else {
+		valueStr := fmt.Sprintf("%v", value)
+		response = fmt.Sprintf("$%d\r\n%s\r\n", len(valueStr), valueStr)
+	}
+
+	// 发送响应到客户端
+	_, err := session.ClientConn.Write([]byte(response))
+	if err != nil {
+		return fmt.Errorf("发送缓存响应失败: %w", err)
 	}
 
 	return nil
@@ -689,6 +842,12 @@ func (h *DedicatedHandler) Close() error {
 
 	for _, session := range sessions {
 		h.cleanupSession(session.ClientConn)
+	}
+
+	// 关闭缓存
+	if h.cache != nil {
+		h.cache.Close()
+		logger.Info("✅ 本地缓存已关闭")
 	}
 
 	// 关闭连接池
