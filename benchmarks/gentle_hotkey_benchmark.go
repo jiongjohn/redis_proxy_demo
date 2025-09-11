@@ -29,7 +29,10 @@ func main() {
 	fmt.Printf("├── 目标服务器: %s\n", host)
 	fmt.Printf("├── 并发客户端: %d (温和压力)\n", numClients)
 	fmt.Printf("├── 测试时长: %v\n", testDuration)
-	fmt.Printf("├── 热Key数量: %d\n", numHotKeys)
+	fmt.Printf("├── 热Key数量: %d (会被缓存)\n", numHotKeys)
+	fmt.Printf("├── 冷Key数量: %d (nocache:前缀，不会被缓存)\n", numHotKeys)
+	fmt.Printf("├── 热Key访问比例: 80%% (缓存测试)\n")
+	fmt.Printf("├── 冷Key访问比例: 20%% (no_cache_prefix测试)\n")
 	fmt.Printf("├── 读操作比例: %.1f%%\n", readRatio*100)
 	fmt.Printf("├── 请求间隔: %dμs\n", requestDelay)
 	fmt.Printf("└── 报告间隔: %v\n", reportInterval)
@@ -122,7 +125,7 @@ type HotKeyIndividualStats struct {
 	MaxLatency   int64
 }
 
-// warmupGentleHotKeys 预热温和热Key数据
+// warmupGentleHotKeys 预热温和热Key数据 (冷Key使用nocache:前缀跳过缓存)
 func warmupGentleHotKeys(host string, numHotKeys int) error {
 	conn, err := net.Dial("tcp", host)
 	if err != nil {
@@ -130,18 +133,28 @@ func warmupGentleHotKeys(host string, numHotKeys int) error {
 	}
 	defer conn.Close()
 
-	// 设置热Key数据
+	// 设置热Key数据 (会被缓存)
 	for i := 0; i < numHotKeys; i++ {
 		key := fmt.Sprintf("gentle_hotkey_%d", i)
 		value := fmt.Sprintf("gentle_hotvalue_%d_stable_data", i)
 		if err := sendSetCommand(conn, key, value); err != nil {
 			return fmt.Errorf("设置热Key失败: %w", err)
 		}
-		fmt.Printf("   预热热Key: %s\n", key)
+		fmt.Printf("   预热热Key: %s (会被缓存)\n", key)
 	}
 
-	// 执行多次GET来确保缓存预热
-	fmt.Printf("   执行缓存预热GET操作...\n")
+	// 设置冷Key数据 (使用nocache:前缀，不会被缓存)
+	for i := 0; i < numHotKeys; i++ {
+		key := fmt.Sprintf("nocache:gentle_coldkey_%d", i)
+		value := fmt.Sprintf("gentle_coldvalue_%d_nocache", i)
+		if err := sendSetCommand(conn, key, value); err != nil {
+			return fmt.Errorf("设置冷Key失败: %w", err)
+		}
+		fmt.Printf("   预热冷Key: %s (nocache:前缀，不会被缓存)\n", key)
+	}
+
+	// 执行多次GET来确保热Key缓存预热
+	fmt.Printf("   执行热Key缓存预热GET操作...\n")
 	for round := 0; round < 10; round++ {
 		for i := 0; i < numHotKeys; i++ {
 			key := fmt.Sprintf("gentle_hotkey_%d", i)
@@ -179,18 +192,28 @@ func runGentleHotKeyClient(clientID int, host string, stats *GentleHotKeyStats, 
 		case <-stopTesting:
 			return
 		default:
-			// 随机选择一个热Key
-			hotKeyIndex := rand.Intn(numHotKeys)
-			key := fmt.Sprintf("gentle_hotkey_%d", hotKeyIndex)
+			// 80%概率访问热Key，20%概率访问冷Key (nocache:前缀)
+			var key string
+			var keyIndex int
+
+			if rand.Float64() < 0.8 {
+				// 访问热Key (会被缓存)
+				keyIndex = rand.Intn(numHotKeys)
+				key = fmt.Sprintf("gentle_hotkey_%d", keyIndex)
+			} else {
+				// 访问冷Key (nocache:前缀，不会被缓存)
+				keyIndex = rand.Intn(numHotKeys)
+				key = fmt.Sprintf("nocache:gentle_coldkey_%d", keyIndex)
+			}
 
 			// 根据读写比例选择操作
 			if rand.Float64() < readRatio {
 				// GET操作（主要操作）
-				executeGentleHotKeyGet(conn, key, hotKeyIndex, stats)
+				executeGentleHotKeyGet(conn, key, keyIndex, stats)
 			} else {
 				// SET操作（偶尔更新）
-				value := fmt.Sprintf("updated_gentle_hotvalue_%d_%d", hotKeyIndex, time.Now().UnixNano())
-				executeGentleHotKeySet(conn, key, value, hotKeyIndex, stats)
+				value := fmt.Sprintf("updated_gentle_value_%d_%d", keyIndex, time.Now().UnixNano())
+				executeGentleHotKeySet(conn, key, value, keyIndex, stats)
 			}
 
 			// 重置超时

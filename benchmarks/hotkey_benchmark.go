@@ -29,7 +29,8 @@ func main() {
 	fmt.Printf("├── 目标服务器: %s\n", host)
 	fmt.Printf("├── 并发客户端: %d\n", numClients)
 	fmt.Printf("├── 测试时长: %v\n", testDuration)
-	fmt.Printf("├── 热Key比例: %.1f%%\n", hotKeyRatio*100)
+	fmt.Printf("├── 热Key比例: %.1f%% (会被缓存)\n", hotKeyRatio*100)
+	fmt.Printf("├── 冷Key比例: %.1f%% (nocache:前缀，不会被缓存)\n", (1-hotKeyRatio)*100)
 	fmt.Printf("├── 热Key数量: %d\n", numHotKeys)
 	fmt.Printf("├── 冷Key数量: %d\n", numColdKeys)
 	fmt.Printf("└── 报告间隔: %v\n", reportInterval)
@@ -109,7 +110,7 @@ type BenchmarkStats struct {
 	LatencyOver50ms  int64
 }
 
-// warmupData 预热数据
+// warmupData 预热数据 (冷Key使用nocache:前缀跳过缓存)
 func warmupData(host string, numHotKeys, numColdKeys int) error {
 	conn, err := net.Dial("tcp", host)
 	if err != nil {
@@ -117,7 +118,7 @@ func warmupData(host string, numHotKeys, numColdKeys int) error {
 	}
 	defer conn.Close()
 
-	// 设置热Key数据
+	// 设置热Key数据 (会被缓存)
 	for i := 0; i < numHotKeys; i++ {
 		key := fmt.Sprintf("hotkey_%d", i)
 		value := fmt.Sprintf("hotvalue_%d_%d", i, time.Now().Unix())
@@ -125,15 +126,17 @@ func warmupData(host string, numHotKeys, numColdKeys int) error {
 			return fmt.Errorf("设置热Key失败: %w", err)
 		}
 	}
+	fmt.Printf("   预热了 %d 个热Key (会被缓存)\n", numHotKeys)
 
-	// 设置冷Key数据
+	// 设置冷Key数据 (使用nocache:前缀，不会被缓存)
 	for i := 0; i < numColdKeys; i++ {
-		key := fmt.Sprintf("coldkey_%d", i)
+		key := fmt.Sprintf("nocache:coldkey_%d", i)
 		value := fmt.Sprintf("coldvalue_%d_%d", i, time.Now().Unix())
 		if err := sendSetCommand(conn, key, value); err != nil {
 			return fmt.Errorf("设置冷Key失败: %w", err)
 		}
 	}
+	fmt.Printf("   预热了 %d 个冷Key (nocache:前缀，不会被缓存)\n", numColdKeys)
 
 	return nil
 }
@@ -167,14 +170,14 @@ func runClient(clientID int, host string, stats *BenchmarkStats, stopTesting <-c
 			var isHotKey bool
 
 			if rand.Float64() < hotKeyRatio {
-				// 访问热Key
+				// 访问热Key (会被缓存)
 				hotKeyIndex := rand.Intn(numHotKeys)
 				key = fmt.Sprintf("hotkey_%d", hotKeyIndex)
 				isHotKey = true
 			} else {
-				// 访问冷Key
+				// 访问冷Key (nocache:前缀，不会被缓存)
 				coldKeyIndex := rand.Intn(numColdKeys)
-				key = fmt.Sprintf("coldkey_%d", coldKeyIndex)
+				key = fmt.Sprintf("nocache:coldkey_%d", coldKeyIndex)
 				isHotKey = false
 			}
 
@@ -419,10 +422,14 @@ func printFinalStats(stats *BenchmarkStats, duration time.Duration) {
 		coldAvgLatency := float64(atomic.LoadInt64(&stats.ColdKeyLatency)) / float64(coldKeyReqs) / 1000000
 		improvement := (coldAvgLatency - hotAvgLatency) / coldAvgLatency * 100
 
-		fmt.Printf("\n🎯 缓存效果分析:\n")
-		fmt.Printf("├── 热Key延迟: %.2f ms\n", hotAvgLatency)
-		fmt.Printf("├── 冷Key延迟: %.2f ms\n", coldAvgLatency)
-		fmt.Printf("└── 性能提升: %.1f%%\n", improvement)
+		fmt.Printf("\n🎯 缓存 vs no_cache_prefix 效果分析:\n")
+		fmt.Printf("├── 热Key延迟 (缓存): %.2f ms\n", hotAvgLatency)
+		fmt.Printf("├── 冷Key延迟 (nocache:前缀): %.2f ms\n", coldAvgLatency)
+		if improvement > 0 {
+			fmt.Printf("└── 缓存性能提升: %.1f%%\n", improvement)
+		} else {
+			fmt.Printf("└── no_cache_prefix更快: %.1f%% (直接访问Redis)\n", -improvement)
+		}
 	}
 
 	fmt.Println(strings.Repeat("=", 60))
