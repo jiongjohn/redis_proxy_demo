@@ -47,7 +47,7 @@ func simpleTest() {
 	//
 	// 2. SET 测试
 	fmt.Print("   SET test:key hello... ")
-	err = rdb.Set(ctx, "test:key", "hello", 0).Err()
+	err = rdb.Set(ctx, "test:key", "hello", 30*time.Second).Err()
 	if err != nil {
 		fmt.Printf("❌ 失败: %v\n", err)
 	} else {
@@ -60,7 +60,22 @@ func simpleTest() {
 	if err != nil {
 		fmt.Printf("❌ 失败: %v\n", err)
 	} else {
-		fmt.Printf("✅ 成功: %s\n", val)
+		fmt.Printf("✅ 成功: %s \n", val)
+	}
+
+	val, err = rdb.Get(ctx, "test:key").Result()
+	if err != nil {
+		fmt.Printf("❌ 失败: %v\n", err)
+	} else {
+		fmt.Printf("✅ 成功22: %s \n", val)
+	}
+
+	key := "nocache:test_key"
+	val, err = rdb.Get(ctx, key).Result()
+	if err != nil {
+		fmt.Printf("❌ key %s 失败: %v\n", key, err)
+	} else {
+		fmt.Printf("✅ key %s 成功: %s \n", key, val)
 	}
 
 	fmt.Println("\n📦 3. 中等大小数据测试")

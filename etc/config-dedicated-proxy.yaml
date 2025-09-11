@@ -42,14 +42,12 @@ redis:
 # 缓存配置（可选）
 cache:
   enabled: true                    # 启用本地缓存
-  ttl: "300s"                      # 缓存项生存时间
-  enable_ttl: true                 # 启用TTL过期
-  eviction_policy: "lru"           # 淘汰策略
-  enable_stats: true               # 启用统计信息
+  ttl: "60s"                      # 缓存项生存时间
   cleanup_interval: "60s"          # 清理间隔
   hard_max_cache_size: 100         # 总缓存大小限制（MB）
   max_entry_size: 1048576          # 单条缓存条目大小限制（字节）- 1MB
-  verbose: false                   # 启用BigCache详细日志（调试用）
+  verbose: true                   # 启用BigCache详细日志（调试用）
+  no_cache_prefix: "nocache:,no-cache:" # 缓存不缓存前缀
 
 # Kafka配置（可选）
 kafka:

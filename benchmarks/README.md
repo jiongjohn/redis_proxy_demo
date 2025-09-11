@@ -6,8 +6,9 @@
 
 ## 🧪 测试程序
 
-### 1. 热Key压力测试 (`hotkey_benchmark.go`)
+### 1. 热Key压力测试套件
 
+#### 1.1 基础热Key测试 (`hotkey_benchmark.go`)
 **目的**: 测试缓存对热点数据的性能提升效果
 
 **特性**:
@@ -16,11 +17,48 @@
 - 实时统计缓存命中率和延迟差异
 - 详细的性能分析报告
 
+#### 1.2 优化热Key测试 (`optimized_hotkey_benchmark.go`)
+**目的**: 优化的热Key场景测试，减少SET操作干扰
+
+**特性**:
+- 90%热Key访问，95%读操作
+- 更少的热Key数量（5个）以提高命中率
+- 30秒测试时长，适合快速验证
+- 详细的延迟分布分析
+
+#### 1.3 纯热Key测试 (`pure_hotkey_benchmark.go`)
+**目的**: 极端热Key场景测试
+
+**特性**:
+- 只访问3个热Key，98%读操作
+- 100并发客户端，极限压力测试
+- 微秒级延迟分布统计
+- 单个热Key详细统计
+
+#### 1.4 温和热Key测试 (`gentle_hotkey_benchmark.go`)
+**目的**: 温和压力下的热Key性能测试
+
+**特性**:
+- 20并发客户端，50μs请求间隔
+- 5个热Key，95%读操作
+- 更精细的延迟分布（100μs, 200μs, 500μs等）
+- 适合展示缓存最佳效果
+
+#### 1.5 缓存命中专项测试 (`cache_hit_benchmark.go`)
+**目的**: 精确测量缓存命中和未命中的性能差异
+
+**特性**:
+- 单连接和并发测试
+- 缓存失效前后对比
+- 热Key vs 冷Key精确对比
+- 5个阶段的全面测试
+
 **测试指标**:
 - 热Key vs 冷Key 延迟对比
-- 缓存命中率
+- 缓存命中率和性能提升百分比
 - 吞吐量提升
 - 延迟分布分析
+- 超快响应率（<500μs）
 
 ### 2. 常规查询压力测试 (`regular_query_benchmark.go`)
 
@@ -91,8 +129,12 @@ cd benchmarks
 ```bash
 cd benchmarks
 
-# 热Key测试
-go run hotkey_benchmark.go
+# 热Key测试套件
+go run hotkey_benchmark.go              # 基础热Key测试
+go run optimized_hotkey_benchmark.go    # 优化热Key测试  
+go run pure_hotkey_benchmark.go         # 纯热Key测试（极限压力）
+go run gentle_hotkey_benchmark.go       # 温和热Key测试（推荐）
+go run cache_hit_benchmark.go           # 缓存命中专项测试
 
 # 常规查询测试
 go run regular_query_benchmark.go

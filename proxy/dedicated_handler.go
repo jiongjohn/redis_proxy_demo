@@ -274,6 +274,10 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 		return nil
 	}
 
+	if commandName == "SELECT" {
+		h.handleInitSelect(session, args)
+	}
+
 	logger.Debug(fmt.Sprintf("📝 [inline=%t]会话 %s 执行命令: %s %v", session.isInline, session.ID, commandName, args[1:]))
 
 	// 缓存处理逻辑
@@ -281,37 +285,20 @@ func (h *DedicatedHandler) handleCommand(session *DedicatedClientSession, args [
 		// 处理 GET 命令
 		if commandName == "GET" && len(args) >= 2 {
 			key := args[1]
-			if value, found := h.cache.ProcessGET(key); found {
+			if value, found := h.cache.ProcessGET(key, session.Context.Database); found {
 				// 缓存命中，直接返回
 				logger.Debug(fmt.Sprintf("🎯 缓存命中: %s", key))
 				return h.sendCachedResponse(session, value)
 			}
-			// 缓存未命中，执行Redis查询并更新缓存
-			return h.executeRedisCommandWithCache(session, rawData, "GET", key, "")
-		}
-
-		// 处理 SET 命令
-		if commandName == "SET" && len(args) >= 3 {
-			key := args[1]
-			value := args[2]
-			// 先执行Redis命令，成功后更新缓存
-			err := h.executeRedisCommand(session, rawData)
-			if err != nil {
-				return err
-			}
-			// Redis执行成功，更新缓存
-			h.cache.ProcessSET(key, value, 0) // TTL为0表示使用默认TTL
-			logger.Debug(fmt.Sprintf("💾 缓存更新: %s", key))
-			return nil
 		}
 	}
 
 	// 非缓存命令或缓存未启用，直接执行Redis命令
-	return h.executeRedisCommand(session, rawData)
+	return h.executeRedisCommand(session, args, rawData)
 }
 
 // executeRedisCommand 执行Redis命令的通用逻辑
-func (h *DedicatedHandler) executeRedisCommand(session *DedicatedClientSession, rawData []byte) error {
+func (h *DedicatedHandler) executeRedisCommand(session *DedicatedClientSession, args []string, rawData []byte) error {
 	// 确保有Redis连接（优化：减少不必要的连接获取）
 	if session.RedisConn == nil {
 		conn, err := h.pool.GetConnection(session.ID, session.Context)
@@ -324,7 +311,7 @@ func (h *DedicatedHandler) executeRedisCommand(session *DedicatedClientSession, 
 	}
 
 	// 转发命令到Redis
-	err := h.forwardCommandRaw(session, rawData)
+	err := h.forwardCommandRaw(session, args, rawData)
 	if err != nil {
 		// 连接出错，释放连接
 		if session.RedisConn != nil {
@@ -332,86 +319,6 @@ func (h *DedicatedHandler) executeRedisCommand(session *DedicatedClientSession, 
 			session.RedisConn = nil
 		}
 		return err
-	}
-
-	return nil
-}
-
-// executeRedisCommandWithCache 执行Redis命令并处理缓存更新
-func (h *DedicatedHandler) executeRedisCommandWithCache(session *DedicatedClientSession, rawData []byte, command, key, setValue string) error {
-	// 确保有Redis连接
-	if session.RedisConn == nil {
-		conn, err := h.pool.GetConnection(session.ID, session.Context)
-		if err != nil {
-			return fmt.Errorf("获取Redis连接失败: %w", err)
-		}
-		session.RedisConn = conn
-		logger.Debug(fmt.Sprintf("会话 %s 获取新Redis连接", session.ID))
-	}
-
-	// 发送命令到Redis
-	session.RedisConn.Conn.SetWriteDeadline(time.Now().Add(h.config.CommandTimeout))
-	if _, err := session.RedisConn.Conn.Write(rawData); err != nil {
-		return fmt.Errorf("发送命令到Redis失败: %w", err)
-	}
-
-	// 对于GET命令，需要解析响应并更新缓存
-	if command == "GET" {
-		return h.forwardResponseWithCacheUpdate(session, key)
-	}
-
-	// 对于其他命令，使用标准转发
-	if session.isInline {
-		return h.forwardResponse(session)
-	}
-	return h.forwardResponseWithProto(session)
-}
-
-// forwardResponseWithCacheUpdate 转发响应并更新缓存
-func (h *DedicatedHandler) forwardResponseWithCacheUpdate(session *DedicatedClientSession, key string) error {
-	timeout := h.config.CommandTimeout
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-
-	// 设置读超时
-	session.RedisConn.Conn.SetReadDeadline(time.Now().Add(timeout))
-	defer session.RedisConn.Conn.SetDeadline(time.Time{})
-
-	// 创建proto Reader来解析响应
-	protoReader := proto.NewReader(session.RedisConn.Conn)
-
-	// 读取Redis响应
-	reply, err := protoReader.ReadReply()
-	if err != nil {
-		if errors.Is(err, proto.Nil) {
-			// Redis返回nil，发送nil响应给客户端
-			response := "$-1\r\n"
-			_, writeErr := session.ClientConn.Write([]byte(response))
-			return writeErr
-		}
-		return fmt.Errorf("读取Redis响应失败: %w", err)
-	}
-
-	// 将响应转换为RESP格式并发送给客户端
-	var response string
-	if reply == nil {
-		response = "$-1\r\n"
-	} else {
-		replyStr := fmt.Sprintf("%v", reply)
-		response = fmt.Sprintf("$%d\r\n%s\r\n", len(replyStr), replyStr)
-
-		// 更新缓存
-		if h.cache != nil {
-			h.cache.ProcessSET(key, reply, 0) // 使用默认TTL
-			logger.Debug(fmt.Sprintf("💾 GET缓存更新: %s", key))
-		}
-	}
-
-	// 发送响应给客户端
-	_, err = session.ClientConn.Write([]byte(response))
-	if err != nil {
-		return fmt.Errorf("发送响应失败: %w", err)
 	}
 
 	return nil
@@ -439,7 +346,10 @@ func (h *DedicatedHandler) sendCachedResponse(session *DedicatedClientSession, v
 
 // ForwardOneRESPResponseWithProto 基于proto库的零缓冲流式转发
 // 直接在解析过程中转发数据块，无需中间缓冲区
-func (h *DedicatedHandler) ForwardOneRESPResponseWithProto(redisConn net.Conn, clientConn net.Conn, timeout time.Duration) error {
+func (h *DedicatedHandler) ForwardOneRESPResponseWithProto(session *DedicatedClientSession, args []string, timeout time.Duration) error {
+	redisConn := session.RedisConn.Conn
+	clientConn := session.ClientConn
+
 	// 创建流式转发器，使用滑动读超时，避免一次性deadline导致长响应中途超时
 	streamForwarder := &StreamForwarder{
 		source:      redisConn,
@@ -468,6 +378,17 @@ func (h *DedicatedHandler) ForwardOneRESPResponseWithProto(redisConn net.Conn, c
 			return err
 		}
 		return fmt.Errorf("流式跳过RESP响应失败: %w", err)
+	}
+
+	commandName := strings.ToUpper(args[0])
+	if len(args) >= 2 && h.cache != nil {
+		redisKey := args[1]
+		if commandName == "GET" || commandName == "SET" {
+			// Redis执行成功，更新缓存
+			h.cache.ProcessSET(redisKey, "SET", session.Context.Database)
+		} else if commandName == "DEL" {
+			h.cache.InvalidateCache(redisKey, session.Context.Database)
+		}
 	}
 
 	return nil
@@ -514,16 +435,16 @@ func (sf *StreamForwarder) Read(p []byte) (n int, err error) {
 }
 
 // forwardResponseWithProto 使用proto库的流式RESP转发
-func (h *DedicatedHandler) forwardResponseWithProto(session *DedicatedClientSession) error {
+func (h *DedicatedHandler) forwardResponseWithProto(session *DedicatedClientSession, args []string) error {
 	timeout := h.config.CommandTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return h.ForwardOneRESPResponseWithProto(session.RedisConn.Conn, session.ClientConn, timeout)
+	return h.ForwardOneRESPResponseWithProto(session, args, timeout)
 }
 
 // forwardCommandRaw 转发原始命令数据到Redis
-func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, rawData []byte) error {
+func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, args []string, rawData []byte) error {
 	if session.RedisConn == nil {
 		return fmt.Errorf("没有可用的Redis连接")
 	}
@@ -540,7 +461,7 @@ func (h *DedicatedHandler) forwardCommandRaw(session *DedicatedClientSession, ra
 		return h.forwardResponse(session)
 	}
 	// 使用proto库的流式转发
-	return h.forwardResponseWithProto(session)
+	return h.forwardResponseWithProto(session, args)
 }
 
 // forwardResponse 零拷贝高性能转发Redis响应到客户端
@@ -585,6 +506,25 @@ func (h *DedicatedHandler) forwardResponse(session *DedicatedClientSession) erro
 	}
 
 	return nil
+}
+
+// handleInitSelect 处理 SELECT 命令
+func (h *DedicatedHandler) handleInitSelect(session *DedicatedClientSession, args []string) {
+	if len(args) != 2 {
+		h.sendError(session.ClientConn, fmt.Errorf("SELECT命令参数错误"))
+		return
+	}
+	var dbNum int
+	if _, err := fmt.Sscanf(args[1], "%d", &dbNum); err != nil {
+		h.sendError(session.ClientConn, fmt.Errorf("无效的数据库编号: %s", args[1]))
+		return
+	}
+
+	session.mu.Lock()
+	session.Context.Database = dbNum
+	session.mu.Unlock()
+
+	return
 }
 
 // parseCommandWithRaw 解析客户端命令并保存原始数据

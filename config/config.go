@@ -53,13 +53,12 @@ type Config struct {
 	Cache struct {
 		Enabled          bool   `json:"enabled,default=true"`
 		TTL              string `json:"ttl,default=60s"`                 // Time to live for cached items
-		EnableTTL        bool   `json:"enable_ttl,default=true"`         // Enable TTL-based expiration
-		EvictionPolicy   string `json:"eviction_policy,default=lru"`     // Eviction policy (lru, lfu, etc.)
 		EnableStats      bool   `json:"enable_stats,default=true"`       // Enable cache statistics
 		CleanupInterval  string `json:"cleanup_interval,default=60s"`    // Cleanup interval for expired items
 		HardMaxCacheSize int    `json:"hard_max_cache_size,default=100"` // Hard limit for total cache size in MB
 		MaxEntrySize     int    `json:"max_entry_size,default=1048576"`  // Maximum size per cache entry in bytes (1MB)
 		Verbose          bool   `json:"verbose,default=false"`           // Enable verbose logging for BigCache
+		NoCachePrefix    string `json:"no_cache_prefix,optional"`        // Comma-separated prefixes for keys that should not be cached
 	} `json:"cache"`
 
 	Kafka struct {

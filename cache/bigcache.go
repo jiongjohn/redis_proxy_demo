@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/allegro/bigcache/v3"
+	"github.com/redis/go-redis/v9"
 
 	"redis-proxy-demo/config"
 	"redis-proxy-demo/lib/logger"
@@ -115,6 +115,15 @@ func (bcw *BigCacheWrapper) Get(key string) (interface{}, bool) {
 		return nil, false
 	}
 
+	// 检查是否过期
+	if entry.ExpiresAt > 0 && time.Now().Unix() > entry.ExpiresAt {
+		logger.Debugf("Cache entry expired for key %s (expired at: %d, now: %d)",
+			key, entry.ExpiresAt, time.Now().Unix())
+		atomic.AddInt64(&bcw.stats.Misses, 1)
+		bcw.updateHitRate()
+		return nil, false
+	}
+
 	atomic.AddInt64(&bcw.stats.Hits, 1)
 	bcw.updateHitRate()
 	return entry.Value, true
@@ -128,6 +137,12 @@ func (bcw *BigCacheWrapper) Set(key string, value interface{}) {
 // SetWithTTL 设置缓存值和TTL
 func (bcw *BigCacheWrapper) SetWithTTL(key string, value interface{}, ttl time.Duration) {
 	if !bcw.enabled {
+		return
+	}
+
+	// 确保至少有2秒的缓存时间
+	if ttl < 2*time.Second {
+		logger.Debugf("SetWithTTL cache ttl less 2 sec, ttl:%v", ttl)
 		return
 	}
 
@@ -153,6 +168,7 @@ func (bcw *BigCacheWrapper) SetWithTTL(key string, value interface{}, ttl time.D
 		logger.Errorf("Failed to set cache entry for key %s: %v", key, err)
 		return
 	}
+	logger.Debugf("SetWithTTL cache success key : %s, ttl:%v", key, ttl)
 
 	atomic.AddInt64(&bcw.stats.Sets, 1)
 }
@@ -234,11 +250,12 @@ func (bcw *BigCacheWrapper) Close() error {
 
 // SmartCache 智能缓存系统
 type SmartCache struct {
-	localCache *BigCacheWrapper
-	config     *config.Config
-	enabled    bool
-	hostname   string
-	mu         sync.RWMutex
+	localCache      *BigCacheWrapper
+	redisClient     *redis.Client
+	config          *config.Config
+	enabled         bool
+	hostname        string
+	noCachePrefixes []string // 不缓存的key前缀列表
 }
 
 // NewSmartCache 创建新的智能缓存
@@ -254,6 +271,19 @@ func NewSmartCache(cfg *config.Config) (*SmartCache, error) {
 	if err != nil {
 		logger.Errorf("Failed to get hostname: %v", err)
 		hostname = "unknown"
+	}
+
+	// 解析不缓存前缀
+	var noCachePrefixes []string
+	if cfg.Cache.NoCachePrefix != "" {
+		prefixes := strings.Split(cfg.Cache.NoCachePrefix, ",")
+		for _, prefix := range prefixes {
+			trimmed := strings.TrimSpace(prefix)
+			if trimmed != "" {
+				noCachePrefixes = append(noCachePrefixes, trimmed)
+			}
+		}
+		logger.Infof("No-cache prefixes configured: %v", noCachePrefixes)
 	}
 
 	// 解析TTL
@@ -273,11 +303,32 @@ func NewSmartCache(cfg *config.Config) (*SmartCache, error) {
 		return nil, fmt.Errorf("failed to create local cache: %w", err)
 	}
 
+	// 创建Redis客户端
+	redisAddr := fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port)
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: cfg.Redis.Password,
+		DB:       0, // 默认数据库，会在查询时动态切换
+	})
+
+	// 测试Redis连接
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		logger.Errorf("Failed to connect to Redis: %v", err)
+		// 不返回错误，继续使用缓存但不查询Redis
+	} else {
+		logger.Info("✅ Redis client connected successfully")
+	}
+
 	return &SmartCache{
-		localCache: localCache,
-		config:     cfg,
-		enabled:    true,
-		hostname:   hostname,
+		localCache:      localCache,
+		redisClient:     redisClient,
+		config:          cfg,
+		enabled:         true,
+		hostname:        hostname,
+		noCachePrefixes: noCachePrefixes,
 	}, nil
 }
 
@@ -301,17 +352,90 @@ func (sc *SmartCache) ShouldCache(command string) bool {
 	return cmd == "GET" || cmd == "SET"
 }
 
+// ShouldCacheKey 检查key是否应该被缓存（检查no-cache前缀）
+func (sc *SmartCache) ShouldCacheKey(key string) bool {
+	if !sc.enabled {
+		return false
+	}
+
+	// 检查key是否匹配任何不缓存前缀
+	for _, prefix := range sc.noCachePrefixes {
+		if strings.HasPrefix(key, prefix) {
+			logger.Debugf("Key %s matches no-cache prefix %s, skipping cache", key, prefix)
+			return false
+		}
+	}
+
+	return true
+}
+
+// RedisKeyInfo Redis键信息
+type RedisKeyInfo struct {
+	Value  interface{}
+	TTL    time.Duration
+	Exists bool
+}
+
+// queryRedisKeyInfo 查询Redis中key的值和TTL
+func (sc *SmartCache) queryRedisKeyInfo(key string, database int) *RedisKeyInfo {
+	if sc.redisClient == nil {
+		return &RedisKeyInfo{Exists: false}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 切换到指定数据库
+	if database != 0 {
+		if err := sc.redisClient.Do(ctx, "SELECT", database).Err(); err != nil {
+			logger.Errorf("Failed to select Redis database %d: %v", database, err)
+			return &RedisKeyInfo{Exists: false}
+		}
+	}
+
+	// 使用pipeline批量查询value和TTL
+	pipe := sc.redisClient.Pipeline()
+	getCmd := pipe.Get(ctx, key)
+	ttlCmd := pipe.TTL(ctx, key)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		logger.Errorf("Failed to query Redis key %s: %v", key, err)
+		return &RedisKeyInfo{Exists: false}
+	}
+
+	// 检查key是否存在
+	value, err := getCmd.Result()
+	if err == redis.Nil {
+		return &RedisKeyInfo{Exists: false}
+	}
+	if err != nil {
+		logger.Errorf("Failed to get Redis key %s value: %v", key, err)
+		return &RedisKeyInfo{Exists: false}
+	}
+
+	// 获取TTL
+	ttl, err := ttlCmd.Result()
+	if err != nil {
+		logger.Errorf("Failed to get Redis key %s TTL: %v", key, err)
+		ttl = -1 // 默认无过期时间
+	}
+
+	return &RedisKeyInfo{
+		Value:  value,
+		TTL:    ttl,
+		Exists: true,
+	}
+}
+
 // ProcessGET 处理GET命令
-func (sc *SmartCache) ProcessGET(key string) (interface{}, bool) {
-	if !sc.ShouldCache("GET") {
+func (sc *SmartCache) ProcessGET(key string, database int) (interface{}, bool) {
+	if !sc.ShouldCache("GET") || !sc.ShouldCacheKey(key) {
 		return nil, false
 	}
 
-	sc.mu.RLock()
-	defer sc.mu.RUnlock()
-
 	// 检查本地缓存
-	cacheKey := fmt.Sprintf("GET:%s", key)
+	cacheKey := fmt.Sprintf("GET:%s:%d", key, database)
 	if value, found := sc.localCache.Get(cacheKey); found {
 		logger.Debugf("Cache HIT for key: %s", key)
 		return value, true
@@ -322,27 +446,31 @@ func (sc *SmartCache) ProcessGET(key string) (interface{}, bool) {
 }
 
 // ProcessSET 处理SET命令
-func (sc *SmartCache) ProcessSET(key string, value interface{}, ttl time.Duration) {
-	if !sc.ShouldCache("SET") {
+func (sc *SmartCache) ProcessSET(key string, database int) {
+	if !sc.ShouldCache("SET") || !sc.ShouldCacheKey(key) {
 		return
 	}
 
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	// 查询Redis获取最新的值和TTL
+	keyInfo := sc.queryRedisKeyInfo(key, database)
+	if !keyInfo.Exists {
+		logger.Debugf("Key %s not found in Redis database %d, skipping cache update", key, database)
+		return
+	}
 
 	// 计算本地缓存TTL
-	localTTL := sc.calculateLocalTTL(ttl)
+	localTTL := sc.calculateLocalTTL(keyInfo.TTL)
 
-	// 更新本地缓存
-	cacheKey := fmt.Sprintf("GET:%s", key) // SET命令影响GET的缓存
-	sc.localCache.SetWithTTL(cacheKey, value, localTTL)
+	// 更新本地缓存，使用database作为后缀
+	cacheKey := fmt.Sprintf("GET:%s:%d", key, database)
+	sc.localCache.SetWithTTL(cacheKey, keyInfo.Value, localTTL)
 
-	logger.Debugf("Updated local cache for SET command, key: %s, TTL: %v", key, localTTL)
+	logger.Debugf("Updated local cache for SET command, key: %s, database: %d, TTL: %v", key, database, localTTL)
 }
 
 // calculateLocalTTL 计算本地缓存TTL
 func (sc *SmartCache) calculateLocalTTL(redisTTL time.Duration) time.Duration {
-	defaultTTL := 60 * time.Second
+	defaultTTL := sc.localCache.defaultTTL
 
 	// 如果Redis没有设置TTL或TTL很长，使用默认60秒
 	if redisTTL <= 0 || redisTTL >= defaultTTL {
@@ -352,58 +480,46 @@ func (sc *SmartCache) calculateLocalTTL(redisTTL time.Duration) time.Duration {
 	// 如果Redis TTL小于60秒，使用 redisTTL * 0.8
 	localTTL := time.Duration(float64(redisTTL) * 0.8)
 
-	// 确保至少有5秒的缓存时间
-	if localTTL < 5*time.Second {
-		localTTL = 5 * time.Second
-	}
-
 	return localTTL
 }
 
-// ProcessRemoteUpdate 处理远程更新，直接使用传入的value更新本地缓存
-func (sc *SmartCache) ProcessRemoteUpdate(key string, value interface{}) {
-	if !sc.enabled {
+// ProcessRemoteUpdate 处理远程更新，查询Redis获取最新值
+func (sc *SmartCache) ProcessRemoteUpdate(key string, database int) {
+	if !sc.enabled || !sc.ShouldCacheKey(key) {
 		return
 	}
 
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	logger.Debugf("Processing remote update for key: %s, database: %d", key, database)
 
-	logger.Debugf("Processing remote update for key: %s", key)
+	// 查询Redis获取最新的值和TTL
+	keyInfo := sc.queryRedisKeyInfo(key, database)
+	if !keyInfo.Exists {
+		// 如果Redis中不存在，则从本地缓存中删除
+		cacheKey := fmt.Sprintf("GET:%s:%d", key, database)
+		sc.localCache.Delete(cacheKey)
+		logger.Debugf("Key %s not found in Redis database %d, removed from local cache", key, database)
+		return
+	}
 
-	// 直接更新本地缓存，使用默认TTL
-	cacheKey := fmt.Sprintf("GET:%s", key)
-	sc.localCache.Set(cacheKey, value)
+	// 计算本地缓存TTL
+	localTTL := sc.calculateLocalTTL(keyInfo.TTL)
 
-	logger.Debugf("Updated local cache for remote update, key: %s", key)
+	// 更新本地缓存
+	cacheKey := fmt.Sprintf("GET:%s:%d", key, database)
+	sc.localCache.SetWithTTL(cacheKey, keyInfo.Value, localTTL)
+
+	logger.Debugf("Updated local cache for remote update, key: %s, database: %d, TTL: %v", key, database, localTTL)
 }
 
 // InvalidateCache 使缓存失效
-func (sc *SmartCache) InvalidateCache(key string) {
-	if !sc.enabled {
+func (sc *SmartCache) InvalidateCache(key string, database int) {
+	if !sc.enabled || !sc.ShouldCacheKey(key) {
 		return
 	}
 
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	cacheKey := fmt.Sprintf("GET:%s", key)
+	cacheKey := fmt.Sprintf("GET:%s:%d", key, database)
 	sc.localCache.Delete(cacheKey)
-	logger.Debugf("Invalidated cache for key: %s", key)
-}
-
-// SetToCache 设置缓存 (实现CacheManager接口)
-func (sc *SmartCache) SetToCache(command, key string, value interface{}) {
-	if !sc.enabled {
-		return
-	}
-
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	cacheKey := fmt.Sprintf("%s:%s", command, key)
-	sc.localCache.Set(cacheKey, value)
-	logger.Debugf("Set cache: command=%s, key=%s, value type=%T", command, key, value)
+	logger.Debugf("Invalidated cache for key: %s, database: %d", key, database)
 }
 
 // Clear 清空所有缓存
@@ -411,9 +527,6 @@ func (sc *SmartCache) Clear() {
 	if !sc.enabled {
 		return
 	}
-
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
 
 	sc.localCache.Clear()
 	logger.Debug("Cleared all local cache")
@@ -426,9 +539,6 @@ func (sc *SmartCache) GetStats() map[string]interface{} {
 			"enabled": false,
 		}
 	}
-
-	sc.mu.RLock()
-	defer sc.mu.RUnlock()
 
 	stats := sc.localCache.Stats()
 	return map[string]interface{}{
@@ -446,8 +556,23 @@ func (sc *SmartCache) GetStats() map[string]interface{} {
 
 // Close 关闭缓存集成器
 func (sc *SmartCache) Close() error {
+	var errs []error
+
 	if sc.localCache != nil {
-		return sc.localCache.Close()
+		if err := sc.localCache.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close local cache: %w", err))
+		}
 	}
+
+	if sc.redisClient != nil {
+		if err := sc.redisClient.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close redis client: %w", err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("multiple errors during close: %v", errs)
+	}
+
 	return nil
 }

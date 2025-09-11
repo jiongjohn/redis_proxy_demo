@@ -1,31 +1,38 @@
 # Go-Redis 客户端连接 Redis 代理演示
 
-这个演示程序展示了如何使用 `github.com/redis/go-redis/v9` 客户端连接到我们的智能连接池 Redis 代理。
+这个演示程序展示了如何使用 `github.com/redis/go-redis/v9` 客户端连接到我们的专用连接池 Redis 代理，包含多种测试脚本。
 
-## 🎯 功能演示
+## 🎯 测试脚本说明
 
-### 1. 基础操作
-- SET/GET/EXISTS/DEL 基本命令
-- 验证基础缓存操作功能
+### 1. 核心命令测试 (`core_commands_test.go`)
+专门测试最常用的 Redis 命令：
+- **字符串操作**: SET, GET, SETNX, GETSET, INCR, DECR, APPEND
+- **哈希操作**: HSET, HGET, HMSET, HMGET, HGETALL, HDEL, HEXISTS  
+- **集合操作**: SADD, SMEMBERS, SCARD, SISMEMBER, SPOP, SREM
+- **列表操作**: LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN
+- **原子操作**: INCR, DECR, INCRBY, DECRBY, SETNX
+- **过期操作**: EXPIRE, TTL, SETEX, PERSIST
 
-### 2. 大Key处理
-- **10KB 数据存储和读取**  
-- **验证数据完整性** (修复的大key bug)
-- 确保大数据无截断传输
-
-### 3. 数据类型操作
-- **List**: LPUSH, LLEN, LRANGE
-- **Hash**: HSET, HLEN, HGETALL  
-- **Set**: SADD, SCARD, SMEMBERS
-
-### 4. 高级特性
-- **事务操作**: MULTI/EXEC 批量命令
+### 2. 全面命令测试 (`comprehensive_test.go`)
+包含所有 Redis 数据类型和高级功能：
+- **字符串、哈希、列表、集合、有序集合**
+- **位图操作**: SETBIT, GETBIT, BITCOUNT
+- **事务操作**: MULTI/EXEC
 - **管道操作**: Pipeline 批量处理
-- **连接信息**: PING, INFO, 连接池统计
+- **大数据测试**: 1KB, 10KB, 100KB 数据
+- **并发测试**: 多goroutine并发操作
+- **性能基准测试**
 
-### 5. 性能测试
-- SET/GET 操作吞吐量测试
-- 连接复用验证
+### 3. 简单测试 (`simple_demo.go`)
+基础连接和操作验证：
+- 连接测试
+- 基本 SET/GET 操作
+- 中等大小数据测试
+
+### 4. 原有完整测试 (`main.go`)
+原始的综合演示程序：
+- 基础操作、大key处理、数据类型操作
+- 事务、管道、连接信息、性能测试
 
 ## 🚀 运行演示
 
@@ -37,13 +44,13 @@
    redis-server
    ```
 
-2. **启动智能连接池代理**:
+2. **启动专用连接池代理**:
    ```bash
    cd ../../  # 回到项目根目录
-   ./redis-proxy-demo -c etc/config-intelligent-pool.yaml
+   ./redis-proxy-demo -c etc/config-dedicated-proxy.yaml
    ```
 
-### 运行演示程序
+### 快速运行（推荐）
 
 ```bash
 # 进入演示目录
@@ -52,7 +59,23 @@ cd example/go-redis-client-demo
 # 初始化Go模块（首次运行）
 go mod tidy
 
-# 运行演示
+# 使用交互式脚本运行测试
+./run_tests.sh
+```
+
+### 手动运行各个测试
+
+```bash
+# 1. 核心命令测试（推荐开始）
+go run core_commands.go
+
+# 2. 全面命令测试
+go run comprehensive.go
+
+# 3. 简单测试
+go run simple_demo.go
+
+# 4. 原有完整测试
 go run main.go
 ```
 
